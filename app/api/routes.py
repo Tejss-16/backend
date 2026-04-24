@@ -30,13 +30,15 @@ logger = logging.getLogger(__name__)
 # Keyed by task_id → {"status": "running"|"completed"|"cancelled"|"error", ...}
 _results: dict[str, dict] = {}
 
-
+@router.get("/")
+def root():
+    return {"message": "API running"}
 # ─────────────────────────────────────────────
 # HEALTH
 # ─────────────────────────────────────────────
-@router.get("/health")
+@router.get("/healthz")
 def health_check():
-    return {"status": "successful"}
+    return {"status": "ok"}
 
 @router.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
