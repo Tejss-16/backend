@@ -42,26 +42,33 @@ def health_check():
 
 @router.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
-    """
-    Upload dataset ONLY (no processing)
-    Returns dataset_id
-    """
-
     contents = await file.read()
     filename = file.filename or ""
 
-    if filename.endswith(".csv"):
-        df = pd.read_csv(io.BytesIO(contents))
-    elif filename.endswith(".xlsx"):
-        df = pd.read_excel(io.BytesIO(contents))
-    else:
+    try:
+        if filename.endswith(".csv"):
+            try:
+                df = pd.read_csv(io.BytesIO(contents), encoding="utf-8")
+            except UnicodeDecodeError:
+                df = pd.read_csv(io.BytesIO(contents), encoding="latin-1")
+
+        elif filename.endswith(".xlsx"):
+            df = pd.read_excel(io.BytesIO(contents))
+
+        else:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Unsupported file format"},
+            )
+
+    except Exception as e:
+        logger.exception("File parsing failed")
         return JSONResponse(
-            status_code=400,
-            content={"error": "Unsupported file format"},
+            status_code=500,
+            content={"error": "Failed to parse file"},
         )
 
     dataset_id = data_store.save(df)
-
     logger.info("Dataset uploaded: %s", dataset_id)
 
     return {"dataset_id": dataset_id}
@@ -106,12 +113,6 @@ async def start_analysis(
         return JSONResponse(
             status_code=400,
             content={"error": "Invalid or expired dataset_id"},
-        )
-
-    if df is None:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "Invalid dataset_id"},
         )
 
     # Mark as running immediately so the frontend sees a valid status on its
