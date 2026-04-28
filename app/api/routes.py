@@ -4,6 +4,8 @@ import io
 import json
 import logging
 import uuid
+import traceback
+import re as _re
 from pydantic import BaseModel
 
 import pandas as pd
@@ -30,15 +32,37 @@ logger = logging.getLogger(__name__)
 # Keyed by task_id → {"status": "running"|"completed"|"cancelled"|"error", ...}
 _results: dict[str, dict] = {}
 
-@router.get("/")
-def root():
-    return {"message": "API running"}
+def _coerce_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Detect and convert string columns that are actually numeric values
+    formatted with currency symbols, commas, or percent signs.
+
+    Examples handled:
+        ₹1,099  →  1099.0
+        64%     →  64
+        4.2     →  4.2  (already numeric — no-op)
+        24,269  →  24269.0
+
+    Safety gate: only converts a column if ≥60% of its non-null values
+    parse successfully, preventing accidental conversion of free-text.
+    """
+    for col in df.select_dtypes(include="object").columns:
+        cleaned = df[col].astype(str).str.replace(
+            r"[₹$€£¥,\s%]", "", regex=True
+        )
+        parsed = pd.to_numeric(cleaned, errors="coerce")
+        non_null = df[col].notna().sum()
+        if non_null > 0 and parsed.notna().sum() / non_null >= 0.60:
+            df[col] = parsed
+            logger.info("Coerced column %r to numeric (dtype=%s)", col, parsed.dtype)
+    return df
+
 # ─────────────────────────────────────────────
 # HEALTH
 # ─────────────────────────────────────────────
-@router.get("/healthz")
+@router.get("/health")
 def health_check():
-    return {"status": "ok"}
+    return {"status": "successful"}
 
 @router.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -51,26 +75,20 @@ async def upload_file(file: UploadFile = File(...)):
                 df = pd.read_csv(io.BytesIO(contents), encoding="utf-8")
             except UnicodeDecodeError:
                 df = pd.read_csv(io.BytesIO(contents), encoding="latin-1")
-
         elif filename.endswith(".xlsx"):
             df = pd.read_excel(io.BytesIO(contents))
-
         else:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "Unsupported file format"},
-            )
+            return JSONResponse(status_code=400, content={"error": "Unsupported file format"})
 
     except Exception as e:
         logger.exception("File parsing failed")
-        return JSONResponse(
-            status_code=500,
-            content={"error": "Failed to parse file"},
-        )
+        return JSONResponse(status_code=500, content={"error": "Failed to parse file"})
+
+    df = _coerce_numeric_columns(df)   # ← ADD THIS LINE
 
     dataset_id = data_store.save(df)
-    logger.info("Dataset uploaded: %s", dataset_id)
-
+    logger.info("Dataset uploaded: %s (%d rows, %d cols, numeric: %s)",
+                dataset_id, *df.shape, df.select_dtypes(include="number").columns.tolist())
     return {"dataset_id": dataset_id}
 
 # ─────────────────────────────────────────────
@@ -115,6 +133,8 @@ async def start_analysis(
             content={"error": "Invalid or expired dataset_id"},
         )
 
+    
+
     # Mark as running immediately so the frontend sees a valid status on its
     # first poll even before the coroutine is scheduled.
     _results[task_id] = {"status": "running"}
@@ -142,7 +162,11 @@ async def start_analysis(
             raise
 
         except Exception as exc:
-            _results[task_id] = {"status": "error", "error": str(exc)}
+            _results[task_id] = {
+                "status": "error",
+                "error": str(exc),
+                "trace": traceback.format_exc()
+            }
             logger.exception("Task %s raised an exception", task_id)
 
         finally:

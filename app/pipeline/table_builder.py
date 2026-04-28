@@ -1,3 +1,10 @@
+# app/pipeline/table_builder.py
+#
+# FIX 3: Removed hard .head(20) cap from pivot tables.
+#         Tables now return all rows by default.
+#         A configurable TABLE_MAX_ROWS constant is provided (default 500)
+#         so operators can tune it without changing logic.
+
 import logging
 logger = logging.getLogger(__name__)
 import pandas as pd
@@ -6,27 +13,25 @@ import pandas as pd
 # 6. TABLE BUILDER
 # ─────────────────────────────────────────────
 
+# FIX 3: was previously hard-coded as .head(20) inside _build_one.
+# Increase this constant or set to None to remove the limit entirely.
+TABLE_MAX_ROWS: int | None = 500   # None = no limit
+
+
 class TableBuilder:
     def __init__(self, df: pd.DataFrame):
         self._df = df
 
     def build_all(self, table_configs: list) -> list:
-        """
-        Accepts either list[TableConfigSchema] (from LLM path) or
-        list[dict] (from _default_tables fallback path).
-        Plain dicts are passed through as-is since they are already rendered.
-        """
         results = []
         for cfg in table_configs:
             if isinstance(cfg, dict):
-                # already a rendered table from _default_tables — pass through
                 results.append(cfg)
             elif (r := self._build_one(cfg)):
                 results.append(r)
         return results
 
     def _build_one(self, cfg) -> dict | None:
-        """cfg is a TableConfigSchema instance."""
         try:
             df    = self._df
             title = cfg.title
@@ -34,7 +39,6 @@ class TableBuilder:
             vals  = cfg.values
             agg   = cfg.aggregation
 
-            # column guard — log and skip rather than raise
             if vals not in df.columns:
                 logger.warning("Table skipped: values column %r not in DataFrame", vals)
                 return None
@@ -46,7 +50,6 @@ class TableBuilder:
                 if idx not in df.columns:
                     logger.warning("Table skipped: index column %r not in DataFrame", idx)
                     return None
-                # cols is optional for pivot — None means no column grouping
                 if cols and cols not in df.columns:
                     logger.warning("Pivot: columns %r not found, building without it", cols)
                     cols = None
@@ -58,13 +61,15 @@ class TableBuilder:
                         columns=cols if cols else None,
                         values=vals,
                         aggfunc=agg,
-                        observed=True,       # silence pandas FutureWarning
+                        observed=True,
                     )
                     .fillna(0)
                     .reset_index()
-                    .head(20)
                 )
-                # flatten MultiIndex columns produced when cols is set
+                # FIX 3: apply configurable cap instead of hard head(20)
+                if TABLE_MAX_ROWS is not None:
+                    pivot = pivot.head(TABLE_MAX_ROWS)
+
                 pivot.columns = [
                     str(c) if not isinstance(c, tuple) else "_".join(str(x) for x in c if x)
                     for c in pivot.columns

@@ -1,46 +1,20 @@
+# app/pipeline/scorecard.py
+#
+# FIX: Raised _SCORECARD_MAX from 4 → 8 to allow richer dashboards.
+
 import logging
-logger = logging.getLogger(__name__)
+import math
 import pandas as pd
 
-# ─────────────────────────────────────────────
-# 7. SCORECARD BUILDER  (deterministic — no LLM)
-# ─────────────────────────────────────────────
+logger = logging.getLogger(__name__)
 
-_SCORECARD_MAX = 5   # hard cap per your spec
-
-_AGG_PRIORITY: list[tuple[str, str, str]] = [
-    # (query_hint, pandas_agg, label_template)
-    # Checked in order; first match wins per column.
-    ("revenue",  "sum",  "Total {col}"),
-    ("sales",    "sum",  "Total {col}"),
-    ("cost",     "sum",  "Total {col}"),
-    ("profit",   "sum",  "Total {col}"),
-    ("qty",      "sum",  "Total {col}"),
-    ("quantity", "sum",  "Total {col}"),
-    ("amount",   "sum",  "Total {col}"),
-    ("price",    "mean", "Avg {col}"),
-    ("rate",     "mean", "Avg {col}"),
-    ("score",    "mean", "Avg {col}"),
-    ("discount", "mean", "Avg {col}"),
-    ("count",    "count","Count of {col}"),
-]
-_DEFAULT_AGG = ("sum", "Total {col}")
-
-
-def _pick_agg(col: str) -> tuple[str, str]:
-    """
-    Choose aggregation + label for a column by name heuristic.
-    Returns (pandas_agg, label_template).
-    """
-    col_lower = col.lower()
-    for hint, agg, label in _AGG_PRIORITY:
-        if hint in col_lower:
-            return agg, label
-    return _DEFAULT_AGG
+_SCORECARD_MAX = 8   # was 4
 
 
 def _fmt_value(v: float) -> str:
-    """Human-readable number: 1 234 567 -> '1.23M', 12345 -> '12.3K', else rounded."""
+    """Human-readable: 1_234_567 → '1.23M', 12_345 → '12.3K', else rounded."""
+    if not math.isfinite(v):
+        return "N/A"
     abs_v = abs(v)
     if abs_v >= 1_000_000:
         return f"{v / 1_000_000:.2f}M"
@@ -48,86 +22,70 @@ def _fmt_value(v: float) -> str:
         return f"{v / 1_000:.1f}K"
     if v == int(v):
         return str(int(v))
-    return f"{v:.2f}"
+    return f"{v:.4g}"
 
 
 class ScorecardBuilder:
     """
-    Builds 3–5 KPI scorecards deterministically from numeric columns.
-    No LLM involved — fast, token-free, always correct.
-
-    Output format per card:
-        {"label": str, "value": str, "raw": float, "column": str, "aggregation": str}
+    Executes LLM-specified scorecard configs against the actual DataFrame.
+    The LLM decides what to show; this class only does the pandas math
+    and formats the result.
     """
 
     def __init__(self, df: pd.DataFrame):
         self._df = df
-        self._num_cols: list[str] = df.select_dtypes(include="number").columns.tolist()
 
-    # ── public ────────────────────────────────────────────────────────
-
-    def build(self) -> list[dict]:
-        """Return a list of scorecard dicts (3–5 items, rendered first in UI)."""
-        if not self._num_cols:
-            logger.info("ScorecardBuilder: no numeric columns — returning empty")
+    def build_from_llm(self, scorecard_configs: list) -> list[dict]:
+        if not scorecard_configs:
+            logger.info("ScorecardBuilder: no LLM scorecard configs — returning empty")
             return []
 
-        candidates = self._rank_columns()
         cards = []
-        for col in candidates[:_SCORECARD_MAX]:
-            card = self._build_one(col)
+        for cfg in scorecard_configs[:_SCORECARD_MAX]:
+            card = self._build_one(cfg)
             if card:
                 cards.append(card)
 
-        logger.info("ScorecardBuilder: produced %d scorecard(s)", len(cards))
+        logger.info("ScorecardBuilder: built %d scorecard(s) from %d LLM configs",
+                    len(cards), len(scorecard_configs))
         return cards
 
-    # ── private ───────────────────────────────────────────────────────
+    def _build_one(self, cfg) -> dict | None:
+        col   = cfg.column
+        agg   = cfg.aggregation
+        label = cfg.label or f"{agg.capitalize()} {col}"
 
-    def _rank_columns(self) -> list[str]:
-        """
-        Rank numeric columns by usefulness:
-          1. Columns whose names match a known KPI hint (revenue, sales …) come first.
-          2. Tie-break: higher variance = more interesting.
-        Drops columns that are effectively IDs (all-unique integers).
-        """
-        df     = self._df
-        ranked = []
-        for col in self._num_cols:
-            n_unique = df[col].nunique()
-            n_rows   = len(df)
-            # skip likely ID columns (>95 % unique integers)
-            if n_unique / max(n_rows, 1) > 0.95 and pd.api.types.is_integer_dtype(df[col]):
-                continue
-            hint_score = sum(
-                1 for hint, *_ in _AGG_PRIORITY if hint in col.lower()
-            )
-            variance = float(df[col].var(ddof=0)) if n_unique > 1 else 0.0
-            ranked.append((col, hint_score, variance))
-
-        # sort: higher hint_score first, then higher variance
-        ranked.sort(key=lambda t: (t[1], t[2]), reverse=True)
-        return [col for col, *_ in ranked]
-
-    def _build_one(self, col: str) -> dict | None:
-        series = self._df[col].dropna()
-        if series.empty:
+        if col not in self._df.columns:
+            logger.warning("Scorecard skip: column %r not in DataFrame", col)
             return None
 
-        agg, label_tpl = _pick_agg(col)
+        series = self._df[col].dropna()
+        if series.empty:
+            logger.warning("Scorecard skip: column %r is all-null", col)
+            return None
+
+        if not pd.api.types.is_numeric_dtype(series):
+            logger.warning("Scorecard skip: column %r is not numeric (dtype=%s)", col, series.dtype)
+            return None
 
         try:
             if agg == "sum":
                 raw = float(series.sum())
             elif agg == "mean":
                 raw = float(series.mean())
-            else:           # "count"
+            elif agg == "count":
                 raw = float(series.count())
+            elif agg == "min":
+                raw = float(series.min())
+            elif agg == "max":
+                raw = float(series.max())
+            else:
+                logger.warning("Scorecard skip: unknown aggregation %r", agg)
+                return None
         except Exception as exc:
-            logger.warning("Scorecard failed for column %r: %s", col, exc)
+            logger.warning("Scorecard compute failed for %r/%r: %s", col, agg, exc)
             return None
 
-        label = label_tpl.format(col=col)
         return {
             "label":       label,
             "value":       _fmt_value(raw),
