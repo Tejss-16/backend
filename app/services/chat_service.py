@@ -1129,65 +1129,73 @@ async def _llm_generate_summary(
     llm,
 ) -> str:
     """
-    Generate a comprehensive structured summary report from the analytics context.
-    Returns a JSON string that the frontend renders as a rich report.
+    Generate a narrative-first, plain-English summary report from the analytics context.
+    Returns a JSON string that the frontend renders as a human-readable story.
     """
     metrics    = schema["metrics"]
     dimensions = schema["dimensions"]
     date_col   = schema.get("date_col")
 
-    prompt = f"""You are a senior data analyst. The user asked: "{query}"
+    prompt = f"""You are a friendly data analyst explaining findings to a non-technical person.
+The user asked: "{query}"
 
 You have been given a comprehensive analytics context computed from their dataset.
-Generate a DETAILED, STRUCTURED analysis report as a JSON object.
+Generate a clear, story-driven report as a JSON object.
 
 Analytics context:
 {json.dumps(summary_context, indent=2, default=str)}
 
-Instructions:
-- Use ONLY the data provided. Do not invent numbers.
-- Be specific: cite actual values, percentages, and segment names from the context.
-- Format large numbers human-readably (e.g. $2.3M, 12.4K, 87.3%).
-- The report should be thorough enough for both a business executive and a data analyst.
-- Include ALL metrics from the context, ALL dimension breakdowns, and any trends.
-- Use plain, clear English. Avoid jargon unless the data naturally suggests it.
-- Adapt the depth to the data: if there's a lot of rich data, give a lot of detail.
+WRITING RULES — follow these strictly:
+1. LEAD WITH THE STORY. The overview must tell the single most important thing in plain English. No jargon.
+2. key_metrics: Pick only 3-5 numbers that matter most. Label them in plain language (e.g. "Money made" not "Total Revenue", "Customers served" not "Unique Customer Count"). Include a "plain_note" — one casual sentence explaining why this number matters.
+3. highlights: These are 2-4 "wow" findings — the most surprising or important things a non-expert should know. Each is a single sentence. Start with the finding, not the category name. E.g. "Technology products bring in twice the profit of Furniture despite similar sales volumes." NOT "Technology: $836K sales, 17.4% margin."
+4. sections: 2-4 sections max, only for distinct groupings (e.g. by category, by region). Each section:
+   - heading: Plain English, not a technical label. E.g. "Which products perform best?" not "Category Performance"
+   - body: 1-2 plain sentences telling the story of this section. Who wins? Who's struggling? Why does it matter?
+   - subsections: Only include if there are clear winners/losers worth naming. Limit to top 3. Each subsection:
+     - name: The segment name (e.g. "Technology", "West Region")
+     - verdict: One plain-English sentence — what's the key takeaway for this segment?
+     - stats: Max 2-3 numbers, labeled simply. Only numbers that support the verdict.
+5. recommendations: 2-3 plain-English actions. Start each with a verb. Make them specific to the actual data. E.g. "Focus discounting on Furniture — it's the only category losing money despite high order volume."
+6. Format numbers human-readably: $2.3M, 12.4K, 87%, ~16 days. Round aggressively.
+7. NEVER use: "it is worth noting", "it is important to", "leverage", "utilize", "synergy", "robust", "paradigm".
+8. NEVER dump raw number lists. Every number must serve the story.
 
 Return ONLY a valid JSON object with this exact structure (no markdown, no extra text):
 {{
   "report_type": "summary",
-  "title": "Descriptive title for this analysis",
-  "overview": "2-3 sentence executive overview of the entire dataset",
-  "date_range": "e.g. Jan 2014 – Dec 2017 (4 years) or null",
+  "title": "Short, plain title describing what this data is about",
+  "overview": "2-3 sentences. The single most important story from this data. Plain English. No jargon. Imagine explaining to a friend.",
+  "date_range": "e.g. Jan 2014 – Dec 2017 or null",
   "key_metrics": [
-    {{"label": "Total Revenue", "value": "$2.3M", "note": "optional context"}},
+    {{"label": "Plain label", "value": "Formatted value", "plain_note": "One casual sentence why this matters"}},
     ...
+  ],
+  "highlights": [
+    "Finding one — a single surprising or important sentence.",
+    "Finding two.",
+    "Finding three."
   ],
   "sections": [
     {{
-      "heading": "Section heading (e.g. Category Performance)",
-      "body": "2-4 sentences of insight for this section",
+      "heading": "Plain question or heading",
+      "body": "1-2 plain sentences telling the story of this section.",
       "subsections": [
         {{
-          "name": "Subsection name (e.g. Technology)",
+          "name": "Segment name",
+          "verdict": "One plain sentence — what's the takeaway?",
           "stats": [
-            {{"label": "Sales", "value": "$836K"}},
-            {{"label": "Margin", "value": "17.4%"}}
-          ],
-          "note": "1 sentence key takeaway"
+            {{"label": "Simple label", "value": "Value"}}
+          ]
         }}
       ]
     }}
   ],
   "recommendations": [
-    "Specific actionable recommendation 1",
-    "Specific actionable recommendation 2",
-    "Specific actionable recommendation 3"
+    "Action-oriented recommendation 1.",
+    "Action-oriented recommendation 2."
   ]
 }}
-
-Generate sections for: overview metrics, then one section per dimension breakdown found in the context, then trends (if date data exists), then correlations (if any), then recommendations.
-Tailor the key_metrics array to the most important 4-8 KPIs visible in the data.
 """
 
     try:
@@ -1196,21 +1204,21 @@ Tailor the key_metrics array to the most important 4-8 KPIs visible in the data.
             {"role": "user", "content": prompt},
         ])
         clean = re.sub(r"```(?:json)?|```", "", raw).strip()
-        # Validate it parses
         parsed = json.loads(clean)
-        parsed["report_type"] = "summary"  # ensure marker is set
+        parsed["report_type"] = "summary"
         return json.dumps(parsed)
     except Exception as e:
         logger.error("LLM summary generation failed: %s", e)
-        # Fallback: plain text summary
         return json.dumps({
             "report_type": "summary",
             "title": "Dataset Analysis",
             "overview": "A summary could not be fully generated. Please try a more specific question.",
             "key_metrics": [],
+            "highlights": [],
             "sections": [],
             "recommendations": [],
         })
+
 
 
 
