@@ -40,20 +40,27 @@ class ChartConfigSchema(BaseModel):
 
     @model_validator(mode="after")
     def box_auto_fills_y(self) -> "ChartConfigSchema":
-        if self.type == "box" and not self.y:
+        if self.type == "box" and not self.y and self.x:
             self.y = self.x
             logger.debug("Box chart: auto-filled y=%r from x", self.x)
         return self
 
     @model_validator(mode="after")
     def non_histogram_needs_y(self) -> "ChartConfigSchema":
-        no_y_types = {"histogram", "box"}
+        no_y_types = {"histogram", "box"}   # box handled by auto-fill above
         if self.type not in no_y_types and not self.y:
             if self.type == "pie":
                 self.aggregation = "count"
             else:
                 raise ValueError(f"Chart type '{self.type}' requires a y column")
         return self
+    
+    @field_validator("x", mode="before")
+    @classmethod
+    def x_must_be_string(cls, v):
+        if v is None:
+            raise ValueError("x column must not be null")
+        return str(v)   # coerce integers/floats to string names gracefully
 
 
 TableType = Literal["pivot", "summary"]

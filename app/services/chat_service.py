@@ -1,56 +1,4 @@
-# app/services/chat_service.py  — V2 (LLM-driven rewrite)
-#
-# CHANGES FROM V1:
-#
-# [0] OFF-TOPIC GUARD  → guard_offtopic() fires before any other step
-#     Rejects queries like "create image of Iron Man", "write a poem",
-#     "what is the weather", etc. with a clear, friendly error message.
-#     Two-layer approach:
-#       Layer A — instant keyword pre-filter (no LLM cost) catches obvious cases.
-#       Layer B — LLM judgment only for ambiguous queries (fail-open: never
-#                 wrongly blocks a legitimate query if the LLM call fails).
-#
-# [1] QUERY UNDERSTANDING  → classify_query() replaced with LLM call (_llm_classify_query)
-#     Old: simple keyword matching ("why"→explanatory, "trend"→trend, etc.)
-#     New: LLM reads the full query + column list and returns the intent type.
-#         Falls back to keyword matching if the LLM call fails.
-#
-# [2] SCHEMA UNDERSTANDING → inspect_schema() enriched by LLM (_llm_inspect_schema)
-#     Old: pure dtype inspection (numeric cols → metrics, object cols → dims)
-#     New: LLM is shown column names + a data sample and annotates which columns
-#          are real business metrics, which are dimensions, junk IDs, dates, etc.
-#         Falls back to dtype-based inspection on failure.
-#
-# [3] REASONING / ANALYTICS → build_reasoning_context() driven by LLM narration
-#     Old: hardcoded pandas blocks (top_contributors, change_detection, trend, etc.)
-#     New: pandas blocks are STILL computed (they are reliable and fast), but the
-#          LLM is given them as structured input and produces the final narrative
-#          rather than being handed raw numbers after the fact.
-#         This keeps determinism where pandas is strong and adds intelligence where
-#         interpretation is needed.
-#
-# [4] RESULT INTERPRETATION → interpret_result() cross-verified by LLM
-#     Old: pure rule-based type detection (scalar / table / list / boolean).
-#     New: after the pandas result is interpreted, a lightweight LLM sanity-check
-#          confirms whether the result actually answers the query and flags
-#          anomalies (e.g. empty result for a query that should have data,
-#          suspiciously large scalar, mismatched columns).
-#
-# [5] TABLE DECISION → should_show_table() replaced with _llm_table_decision()
-#     Old: pure rule-based — scalar/boolean → no table, anything else → table.
-#     New: LLM receives the query, result metadata, and column list and decides
-#          whether a table adds value. Falls back to rule-based on failure.
-#
-# [6] DETERMINISTIC ANSWERS → deterministic_answer() removed; always use LLM
-#     Old: scalar → "The result is 123."  (no context, no units, no insight)
-#          boolean → None  (fell through to LLM anyway, inconsistently)
-#          1-row table → "The result is X."
-#     New: ALL non-empty results go through the LLM narration step. The LLM
-#          receives the full meta dict (type, value, sample) and produces a
-#          contextual, human-readable answer. This is strictly better for every
-#          result type — a scalar like 123456.78 becomes "Total revenue for Q3
-#          was ₹1.23L, driven by…" instead of "The result is 123456.78."
-
+# app/services/chat_service.py 
 from app.pipeline.llm_client import LLMClient
 import logging
 import asyncio
@@ -605,11 +553,23 @@ TREND_TRIGGERS       = [
     "increase", "decrease", "increasing", "decreasing",
     "trend", "growth", "decline", "up", "down",
 ]
+SUMMARY_TRIGGERS = [
+    "give me insights", "give insights", "analyse", "analyze", "analysis",
+    "summarize", "summarise", "summary", "overview", "give information",
+    "tell me about", "what can you tell", "give me information",
+    "deep dive", "deep analysis", "full analysis", "complete analysis",
+    "breakdown", "performance", "executive summary", "report",
+    "insights", "key findings", "key metrics", "key insights",
+    "what does the data show", "what does the data say", "explore",
+    "overall", "holistic", "comprehensive", "give me a report",
+]
 
 
 def _keyword_classify_query(query: str) -> str:
     """Original keyword-based fallback."""
     q = query.lower()
+    if any(t in q for t in SUMMARY_TRIGGERS):
+        return "summary"
     if any(t in q for t in EXPLANATION_TRIGGERS):
         return "explanatory"
     if any(t in q for t in COMPARISON_TRIGGERS):
@@ -622,7 +582,7 @@ def _keyword_classify_query(query: str) -> str:
 async def _llm_classify_query(query: str, columns: list, llm) -> str:
     """
     Use the LLM to classify the query intent.
-    Returns one of: explanatory | comparison | trend | lookup
+    Returns one of: explanatory | comparison | trend | lookup | summary
     Falls back to keyword matching on failure.
     """
     prompt = f"""Classify the user's data analytics query into exactly one intent type.
@@ -631,6 +591,7 @@ User query: {query}
 Dataset columns: {columns}
 
 Intent types:
+- "summary"     — user wants a broad overview, insights, analysis, report, or exploration of the whole dataset
 - "explanatory" — user asks WHY something happened, wants causes/drivers/reasons
 - "comparison"  — user wants to compare two or more groups, segments, or time periods
 - "trend"       — user wants to see how a metric changed over time (up/down/flat)
@@ -638,11 +599,12 @@ Intent types:
 
 Rules:
 - Pick the single BEST intent. Do not mix.
+- "summary" applies to: "give me insights", "analyse this", "give information", "summarize", "overview", "tell me about the data", "what does the data show", "explore the data", "give me a report", "key metrics", "executive summary".
 - "trend" requires a time dimension; without dates, re-classify as "lookup".
 - "explanatory" queries often contain: why, reason, cause, explain, what drove, contributing.
 - Phrasing like "has sales gone up" is a trend, even without the word "trend".
 
-Return ONLY valid JSON: {{"intent": "explanatory"}} (or comparison/trend/lookup)
+Return ONLY valid JSON: {{"intent": "summary"}} (or explanatory/comparison/trend/lookup)
 No markdown. No explanation.
 """
     try:
@@ -652,7 +614,7 @@ No markdown. No explanation.
         ])
         clean = re.sub(r"```(?:json)?|```", "", raw).strip()
         intent = json.loads(clean).get("intent", "").strip().lower()
-        if intent in ("explanatory", "comparison", "trend", "lookup"):
+        if intent in ("explanatory", "comparison", "trend", "lookup", "summary"):
             logger.info("LLM query classification: %r → %s", query[:60], intent)
             return intent
         logger.warning("LLM returned unknown intent %r — falling back to keyword match", intent)
@@ -1030,8 +992,228 @@ def format_history(history: list[dict]) -> str:
 
 
 # ─────────────────────────────────────────────
-# SERVICE
+# LAYER 3d — Summary Analytics  (NEW)
+# Runs ALL analytics blocks across ALL metrics & dims
+# to power the comprehensive summary response.
 # ─────────────────────────────────────────────
+
+def build_summary_context(df: pd.DataFrame, schema: dict) -> dict:
+    """
+    Build a comprehensive analytics context for summary/insight queries.
+    Runs all available blocks across metrics and dimensions.
+    Returns a rich dict that the LLM uses to produce a structured report.
+    """
+    metrics    = schema["metrics"]
+    dimensions = schema["dimensions"]
+    date_col   = schema["date_col"]
+
+    if not metrics:
+        return {}
+
+    summary = {
+        "shape": {"rows": int(len(df)), "cols": int(len(df.columns))},
+        "metrics": {},
+        "dimensions": {},
+        "trends": {},
+        "correlations": [],
+    }
+
+    # ── Dataset date range ────────────────────────────────────────────────
+    if date_col:
+        try:
+            dates = pd.to_datetime(df[date_col], errors="coerce").dropna()
+            if not dates.empty:
+                summary["date_range"] = {
+                    "start": str(dates.min().date()),
+                    "end":   str(dates.max().date()),
+                    "days":  int((dates.max() - dates.min()).days),
+                }
+        except Exception:
+            pass
+
+    # ── Per-metric stats ──────────────────────────────────────────────────
+    for metric in metrics[:6]:  # cap at 6 metrics
+        try:
+            col = df[metric].dropna()
+            stats = {
+                "total":  clean_value(col.sum()),
+                "mean":   round(float(col.mean()), 2),
+                "median": round(float(col.median()), 2),
+                "min":    clean_value(col.min()),
+                "max":    clean_value(col.max()),
+                "count":  int(col.count()),
+            }
+            # Per-dimension breakdown for top 2 dims
+            dim_breakdown = {}
+            for dim in dimensions[:2]:
+                try:
+                    grp = df.groupby(dim)[metric].agg(["sum", "mean", "count"]).reset_index()
+                    grp.columns = [dim, "total", "mean", "count"]
+                    grp = grp.sort_values("total", ascending=False)
+                    dim_breakdown[dim] = [
+                        {
+                            "segment": clean_value(r[dim]),
+                            "total":   clean_value(r["total"]),
+                            "mean":    round(float(r["mean"]), 2),
+                            "count":   int(r["count"]),
+                            "pct":     round(float(r["total"]) / float(col.sum()) * 100, 1)
+                                       if col.sum() else None,
+                        }
+                        for _, r in grp.head(6).iterrows()
+                    ]
+                except Exception:
+                    pass
+            stats["by_dimension"] = dim_breakdown
+
+            # Time trend (monthly totals)
+            if date_col:
+                try:
+                    tmp = df.copy()
+                    tmp[date_col] = pd.to_datetime(tmp[date_col], errors="coerce")
+                    monthly = (
+                        tmp.dropna(subset=[date_col])
+                        .resample("ME", on=date_col)[metric]
+                        .sum()
+                        .reset_index()
+                    )
+                    monthly["period"] = monthly[date_col].dt.to_period("M").astype(str)
+                    periods = [
+                        {"period": r["period"], "value": clean_value(r[metric])}
+                        for _, r in monthly.iterrows()
+                    ]
+                    stats["trend"] = {
+                        "periods": periods,
+                        "peak_period": max(periods, key=lambda x: x["value"] or 0) if periods else None,
+                        "low_period":  min(periods, key=lambda x: x["value"] or 0) if periods else None,
+                    }
+                except Exception:
+                    pass
+
+            summary["metrics"][metric] = stats
+        except Exception as e:
+            logger.warning("Summary metric block failed for %s: %s", metric, e)
+
+    # ── Dimension cardinality & top values ────────────────────────────────
+    for dim in dimensions[:5]:
+        try:
+            vc = df[dim].value_counts().reset_index()
+            vc.columns = [dim, "count"]
+            summary["dimensions"][dim] = {
+                "unique": int(df[dim].nunique()),
+                "top_values": [
+                    {"value": clean_value(r[dim]), "count": int(r["count"])}
+                    for _, r in vc.head(5).iterrows()
+                ],
+            }
+        except Exception:
+            pass
+
+    # ── Numeric correlations ──────────────────────────────────────────────
+    try:
+        num_df = df[metrics].dropna()
+        if len(metrics) >= 2 and len(num_df) > 10:
+            corr = num_df.corr(numeric_only=True)
+            pairs = _extract_top_correlations(corr)
+            summary["correlations"] = pairs.to_dict(orient="records") if not pairs.empty else []
+    except Exception:
+        pass
+
+    return summary
+
+
+async def _llm_generate_summary(
+    query: str,
+    summary_context: dict,
+    schema: dict,
+    history_block: str,
+    llm,
+) -> str:
+    """
+    Generate a comprehensive structured summary report from the analytics context.
+    Returns a JSON string that the frontend renders as a rich report.
+    """
+    metrics    = schema["metrics"]
+    dimensions = schema["dimensions"]
+    date_col   = schema.get("date_col")
+
+    prompt = f"""You are a senior data analyst. The user asked: "{query}"
+
+You have been given a comprehensive analytics context computed from their dataset.
+Generate a DETAILED, STRUCTURED analysis report as a JSON object.
+
+Analytics context:
+{json.dumps(summary_context, indent=2, default=str)}
+
+Instructions:
+- Use ONLY the data provided. Do not invent numbers.
+- Be specific: cite actual values, percentages, and segment names from the context.
+- Format large numbers human-readably (e.g. $2.3M, 12.4K, 87.3%).
+- The report should be thorough enough for both a business executive and a data analyst.
+- Include ALL metrics from the context, ALL dimension breakdowns, and any trends.
+- Use plain, clear English. Avoid jargon unless the data naturally suggests it.
+- Adapt the depth to the data: if there's a lot of rich data, give a lot of detail.
+
+Return ONLY a valid JSON object with this exact structure (no markdown, no extra text):
+{{
+  "report_type": "summary",
+  "title": "Descriptive title for this analysis",
+  "overview": "2-3 sentence executive overview of the entire dataset",
+  "date_range": "e.g. Jan 2014 – Dec 2017 (4 years) or null",
+  "key_metrics": [
+    {{"label": "Total Revenue", "value": "$2.3M", "note": "optional context"}},
+    ...
+  ],
+  "sections": [
+    {{
+      "heading": "Section heading (e.g. Category Performance)",
+      "body": "2-4 sentences of insight for this section",
+      "subsections": [
+        {{
+          "name": "Subsection name (e.g. Technology)",
+          "stats": [
+            {{"label": "Sales", "value": "$836K"}},
+            {{"label": "Margin", "value": "17.4%"}}
+          ],
+          "note": "1 sentence key takeaway"
+        }}
+      ]
+    }}
+  ],
+  "recommendations": [
+    "Specific actionable recommendation 1",
+    "Specific actionable recommendation 2",
+    "Specific actionable recommendation 3"
+  ]
+}}
+
+Generate sections for: overview metrics, then one section per dimension breakdown found in the context, then trends (if date data exists), then correlations (if any), then recommendations.
+Tailor the key_metrics array to the most important 4-8 KPIs visible in the data.
+"""
+
+    try:
+        raw = await llm._call([
+            {"role": "system", "content": "Return ONLY valid JSON. No markdown. No preamble. No explanation."},
+            {"role": "user", "content": prompt},
+        ])
+        clean = re.sub(r"```(?:json)?|```", "", raw).strip()
+        # Validate it parses
+        parsed = json.loads(clean)
+        parsed["report_type"] = "summary"  # ensure marker is set
+        return json.dumps(parsed)
+    except Exception as e:
+        logger.error("LLM summary generation failed: %s", e)
+        # Fallback: plain text summary
+        return json.dumps({
+            "report_type": "summary",
+            "title": "Dataset Analysis",
+            "overview": "A summary could not be fully generated. Please try a more specific question.",
+            "key_metrics": [],
+            "sections": [],
+            "recommendations": [],
+        })
+
+
+
 
 class ChatService:
     def __init__(self, df: pd.DataFrame):
@@ -1060,6 +1242,19 @@ class ChatService:
 
         # ── STEP 0b: INSPECT SCHEMA — LLM-driven  [CHANGE 2] ─────────────────
         schema = await _llm_inspect_schema(self.df, self._llm)
+
+        # ── SUMMARY PATH — fires before reasoning/code for broad queries ──────
+        if query_type == "summary":
+            logger.info("Summary path triggered for query: %s", query)
+            summary_context = build_summary_context(self.df, schema)
+            summary_json = await _llm_generate_summary(
+                query=query,
+                summary_context=summary_context,
+                schema=schema,
+                history_block=history_block,
+                llm=self._llm,
+            )
+            return {"answer": summary_json, "table": None, "is_summary": True}
 
         # ── REASONING LAYER — pandas blocks + LLM narration  [CHANGE 3] ──────
         reasoning_insights: list[dict] = []

@@ -6,7 +6,9 @@ import math
 import numpy as np
 import pandas as pd
 from app.pipeline.transformer import DataTransformer
- 
+from app.utils.column_utils import _meaningful_numeric_cols
+from app.utils.column_utils import _is_id_col
+
 logger = logging.getLogger(__name__)
 
 #Backend does ALL statistical work before sending to the frontend:
@@ -267,30 +269,104 @@ class ChartBuilder:
                 }
 
             # ── heatmap ──────────────────────────────────────────────────────
-            # No scale distortion risk (color scale auto-normalizes)
             if chart_type == "heatmap":
-                z_col = cfg.get("z") or y
-                if z_col not in df.columns:
-                    logger.warning("Heatmap: z column %r not found", z_col)
+                z_col = cfg.get("z")
+
+                # Step 1: basic validation
+                if not z_col or z_col not in df.columns:
                     return None
+
+                # Step 2: create safe df FIRST
+                safe_df = df[[x, y, z_col]].copy()
+
+                # Force numeric BEFORE ANY CHECK
+                safe_df[z_col] = pd.to_numeric(safe_df[z_col], errors="coerce")
+
+                # Drop bad rows
+                safe_df = safe_df.dropna(subset=[z_col])
+
+                if safe_df.empty:
+                    logger.error("Heatmap failed: z column invalid after conversion")
+                    return None
+
+                logger.info("Heatmap dtype AFTER FIX: %s", safe_df[z_col].dtype)
+
+                # Step 3: Limit dimensions to keep the grid readable.
+                # Cap at 20 rows × 20 columns — beyond this the cells become too
+                # small to read and color differences become imperceptible.
+                MAX_DIM = 20
+                top_x_vals = (
+                    safe_df.groupby(x)[z_col].sum()
+                    .nlargest(MAX_DIM).index.tolist()
+                )
+                top_y_vals = (
+                    safe_df.groupby(y)[z_col].sum()
+                    .nlargest(MAX_DIM).index.tolist()
+                )
+                safe_df = safe_df[
+                    safe_df[x].isin(top_x_vals) & safe_df[y].isin(top_y_vals)
+                ]
+
+                # Step 4: pivot
                 try:
-                    pivot = (
-                        pd.pivot_table(df, index=y, columns=x, values=z_col,
-                                       aggfunc="mean", observed=True)
-                        .fillna(0)
+                    pivot = safe_df.pivot_table(
+                        index=y,
+                        columns=x,
+                        values=z_col,
+                        aggfunc="mean"
                     )
-                    return {
-                        "type": "heatmap", "title": cfg["title"],
-                        "x": pivot.columns.tolist(),
-                        "y": pivot.index.tolist(),
-                        "z": pivot.values.tolist(),
-                        "x_label": x, "y_label": y, "z_label": z_col,
-                        "layout_size": cfg["layout_size"],
-                    }
                 except Exception as exc:
                     logger.error("Heatmap pivot failed: %s", exc)
                     return None
 
+                # Step 5: Sort rows and columns by their totals (highest → lowest)
+                # so the most significant patterns appear in the top-left corner.
+                row_order = pivot.sum(axis=1).sort_values(ascending=False).index
+                col_order = pivot.sum(axis=0).sort_values(ascending=False).index
+                pivot = pivot.loc[row_order, col_order]
+
+                # Step 6: Detect scale distortion.
+                # If the max value is more than 10× the median, a single cell will
+                # dominate the color scale and wash out everything else.
+                # In that case, apply log1p normalization and flag it so the
+                # frontend can label the color bar correctly.
+                flat_vals = pivot.values.flatten()
+                flat_vals = flat_vals[~np.isnan(flat_vals)]
+                use_log_scale = False
+                if len(flat_vals) > 1:
+                    med = float(np.median(flat_vals[flat_vals > 0])) if np.any(flat_vals > 0) else 0
+                    max_val = float(np.max(flat_vals))
+                    if med > 0 and max_val / med > 10:
+                        use_log_scale = True
+                        pivot = pivot.apply(lambda col: np.log1p(col.clip(lower=0)))
+
+                z_values = pivot.values.tolist()
+
+                # Step 7: Annotate cells when the grid is small enough to be readable.
+                # For grids up to 10×10, pass the raw (un-logged) cell values for
+                # display inside each cell. The frontend shows them as formatted numbers.
+                n_rows, n_cols = pivot.shape
+                cell_annotations: list | None = None
+                if n_rows <= 10 and n_cols <= 10:
+                    # Re-pivot original (non-log) values for the text layer
+                    raw_pivot = safe_df.pivot_table(
+                        index=y, columns=x, values=z_col, aggfunc="mean"
+                    ).loc[row_order[:n_rows], col_order[:n_cols]]
+                    cell_annotations = raw_pivot.values.tolist()
+
+                return {
+                    "type":             "heatmap",
+                    "title":            cfg["title"],
+                    "x":                pivot.columns.tolist(),
+                    "y":                pivot.index.tolist(),
+                    "z":                z_values,
+                    "cell_annotations": cell_annotations,  # None when grid is large
+                    "use_log_scale":    use_log_scale,      # True → color bar is log1p
+                    "x_label":          x,
+                    "y_label":          y,
+                    "z_label":          z_col,
+                    "layout_size":      cfg["layout_size"],
+                }
             # ── bubble ───────────────────────────────────────────────────────
             # Size distortion handled client-side via min-max normalization
             if chart_type == "bubble":
@@ -307,11 +383,200 @@ class ChartBuilder:
 
             # ── funnel ───────────────────────────────────────────────────────
             if chart_type == "funnel":
+                # ── Semantic pre-flight: detect bad column pairings BEFORE any
+                # data work, even if the LLM produced the config.
+                #
+                # A funnel x-axis must be a genuine stage/step label column.
+                # Date columns, geographic columns, and high-cardinality IDs are
+                # never valid funnel stages. When a bad pairing is detected, we
+                # redirect to the semantically correct chart type immediately —
+                # no "not_possible" dead end, and no misleading fallback bar.
+
+                _DATE_HINTS  = ("date", "time", "month", "year", "day", "week",
+                                "period", "created", "updated", "order_date", "ship")
+                _GEO_HINTS   = ("region", "country", "state", "city", "zip",
+                                "postal", "location", "territory", "market")
+                _STAGE_HINTS = ("stage", "step", "phase", "funnel", "pipeline",
+                                "status", "level", "tier", "bucket", "segment")
+
+                x_lower = x.lower()
+
+                def _is_date_col(col: str) -> bool:
+                    """True if col looks like a date/time axis."""
+                    if pd.api.types.is_datetime64_any_dtype(self._transformer._source[col]):
+                        return True
+                    col_l = col.lower()
+                    return any(h in col_l for h in _DATE_HINTS)
+
+                def _is_geo_col(col: str) -> bool:
+                    col_l = col.lower()
+                    return any(h in col_l for h in _GEO_HINTS)
+
+                def _has_stage_hints(col: str) -> bool:
+                    col_l = col.lower()
+                    return any(h in col_l for h in _STAGE_HINTS)
+
+                # Check 1: date column as x → redirect to line chart
+                if _is_date_col(x):
+                    logger.warning(
+                        "Funnel rejected: x='%s' is a date/time column, not a stage label. "
+                        "Redirecting to line chart.", x
+                    )
+                    # Build a proper line chart payload directly
+                    line_df = df[[x, y]].copy()
+                    line_df[y] = pd.to_numeric(line_df[y], errors="coerce")
+                    line_df = line_df.dropna(subset=[y])
+                    return {
+                        "type":          "line",
+                        "fallback_from": "funnel",
+                        "fallback_reason": f"'{x}' is a time column — showing trend instead",
+                        "title":         cfg["title"].replace("Funnel", "Trend").replace("funnel", "Trend"),
+                        "x":             line_df[x].astype(str).tolist(),
+                        "y":             line_df[y].tolist(),
+                        "x_label":       x,
+                        "y_label":       y,
+                        "layout_size":   "large",
+                        "y_range":       None,
+                    }
+
+                # Check 2: geographic / regional column as x → redirect to bar
+                if _is_geo_col(x) and not _has_stage_hints(x):
+                    logger.warning(
+                        "Funnel rejected: x='%s' is a geographic column, not a stage label. "
+                        "Redirecting to bar chart.", x
+                    )
+                    bar_df = df[[x, y]].copy()
+                    bar_df[y] = pd.to_numeric(bar_df[y], errors="coerce")
+                    bar_df = bar_df.dropna(subset=[y]).nlargest(20, y)
+                    return {
+                        "type":          "bar",
+                        "fallback_from": "funnel",
+                        "fallback_reason": f"'{x}' is a geographic column — showing bar comparison instead",
+                        "title":         cfg["title"],
+                        "x":             bar_df[x].tolist(),
+                        "y":             bar_df[y].tolist(),
+                        "x_label":       x,
+                        "y_label":       y,
+                        "layout_size":   cfg["layout_size"],
+                        "y_range":       None,
+                    }
+
+                # Check 3: high-cardinality x with no stage hints → redirect to bar
+                x_unique = self._transformer._source[x].nunique()
+                if x_unique > 10 and not _has_stage_hints(x):
+                    logger.warning(
+                        "Funnel rejected: x='%s' has %d unique values and no stage-name hints. "
+                        "Redirecting to bar chart.", x, x_unique
+                    )
+                    bar_df = df[[x, y]].copy()
+                    bar_df[y] = pd.to_numeric(bar_df[y], errors="coerce")
+                    bar_df = bar_df.dropna(subset=[y]).nlargest(20, y)
+                    return {
+                        "type":          "bar",
+                        "fallback_from": "funnel",
+                        "fallback_reason": f"'{x}' has too many unique values for a funnel — showing top categories instead",
+                        "title":         cfg["title"],
+                        "x":             bar_df[x].tolist(),
+                        "y":             bar_df[y].tolist(),
+                        "x_label":       x,
+                        "y_label":       y,
+                        "layout_size":   cfg["layout_size"],
+                        "y_range":       None,
+                    }
+
+                # Helper: build a bar-chart fallback payload so the user still
+                # gets a useful visualisation with a clear "why no funnel" note.
+                def _funnel_fallback(reason: str) -> dict:
+                    logger.warning("Funnel → bar fallback: %s", reason)
+                    bar_df = df[[x, y]].copy()
+                    bar_df[y] = pd.to_numeric(bar_df[y], errors="coerce")
+                    bar_df = bar_df.dropna(subset=[y]).nlargest(20, y)
+                    return {
+                        "type":          "bar",
+                        "fallback_from": "funnel",
+                        "fallback_reason": reason,
+                        "title":         cfg["title"],
+                        "x":             bar_df[x].tolist(),
+                        "y":             bar_df[y].tolist(),
+                        "x_label":       x,
+                        "y_label":       y,
+                        "layout_size":   cfg["layout_size"],
+                        "y_range":       None,
+                    }
+
+                # FIX 5: Validate y is numeric before doing anything else.
+                if not pd.api.types.is_numeric_dtype(df[y]):
+                    coerced = pd.to_numeric(df[y], errors="coerce")
+                    if coerced.notna().sum() / max(len(df), 1) < 0.5:
+                        return _funnel_fallback("y column is not numeric")
+                    df = df.copy()
+                    df[y] = coerced
+
+                stages = df[x].tolist()
+                values = pd.to_numeric(df[y], errors="coerce").tolist()
+                n_steps = len(stages)
+
+                if n_steps < 2:
+                    return _funnel_fallback("fewer than 2 stages")
+
+                # FIX 1: Auto-sort descending so the user doesn't need to
+                # pre-order their data — the funnel shape will always be correct.
+                pairs  = sorted(
+                    zip(stages, values),
+                    key=lambda t: (t[1] is None or math.isnan(t[1]), -(t[1] or 0)),
+                )
+                # pairs is ascending; reverse for descending (largest first)
+                pairs  = list(reversed(pairs))
+                stages = [p[0] for p in pairs]
+                values = [p[1] for p in pairs]
+
+                # After sorting, cap at 6 stages (ideal funnel range).
+                if len(stages) > 6:
+                    logger.warning("Funnel: truncating %d stages to 6.", len(stages))
+                    stages = stages[:6]
+                    values = values[:6]
+
+                non_null = [v for v in values if v is not None and not (isinstance(v, float) and math.isnan(v))]
+
+                # FIX 2: Relaxed monotonic check — allow up to 30% of transitions
+                # to be out-of-order (noise tolerance) rather than a hard limit of 1.
+                # Only reject when the data is clearly non-funnel (majority non-decreasing).
+                inversions = sum(
+                    1 for i in range(len(non_null) - 1)
+                    if non_null[i] < non_null[i + 1]
+                )
+                if inversions > len(non_null) * 0.3:
+                    return _funnel_fallback(
+                        f"values are not monotonically decreasing "
+                        f"({inversions} inversions out of {len(non_null) - 1} transitions)"
+                    )
+
+                # Compute per-step conversion rates relative to the previous step.
+                conversion_pcts: list[float | None] = [None]
+                for i in range(1, len(non_null)):
+                    prev = non_null[i - 1]
+                    curr = non_null[i]
+                    pct  = round((curr / prev) * 100, 1) if prev else None
+                    conversion_pcts.append(pct)
+
+                # Identify the single biggest drop-off stage index.
+                drops = [
+                    (i, (non_null[i - 1] - non_null[i]) / non_null[i - 1])
+                    for i in range(1, len(non_null))
+                    if non_null[i - 1]
+                ]
+                biggest_drop_idx = max(drops, key=lambda t: t[1])[0] if drops else None
+
                 return {
-                    "type": "funnel", "title": cfg["title"],
-                    "x": df[x].tolist(), "y": df[y].tolist(),
-                    "x_label": x, "y_label": y,
-                    "layout_size": cfg["layout_size"],
+                    "type":              "funnel",
+                    "title":             cfg["title"],
+                    "x":                 stages,
+                    "y":                 values,
+                    "conversion_pcts":   conversion_pcts,
+                    "biggest_drop_idx":  biggest_drop_idx,
+                    "x_label":           x,
+                    "y_label":           y,
+                    "layout_size":       cfg["layout_size"],
                 }
 
             # ── treemap ──────────────────────────────────────────────────────

@@ -1,16 +1,4 @@
 # app/services/chart_service.py
-#
-# FIXES in this version (cumulative — includes all previous fixes):
-#
-# FIX 1–5: (unchanged from previous version)
-# FIX 6: Date-range filtering from natural language queries (previous version)
-# FIX 7 (NEW — pairs with transformer FIX A/B/C/D): _apply_date_filter() now
-#   stores the parsed datetime Series back into the filtered DataFrame under
-#   the original column name.  This means the transformer receives a proper
-#   datetime64 column instead of raw strings, so:
-#     a) _is_time() immediately recognises it → no re-parsing overhead
-#     b) _sort_chronologically() sorts datetime64 directly → correct order
-#     c) The string-sort bug that scrambled the x-axis is eliminated
 
 import asyncio
 import concurrent.futures
@@ -19,8 +7,17 @@ import os
 import re
 import time
 from datetime import datetime
+from app.utils.column_utils import _meaningful_numeric_cols
+
 
 import pandas as pd
+
+# _meaningful_numeric_cols logs at INFO on every call. It is called once per
+# chart config processed (inside ChartConfigNormalizer.normalize, which runs
+# in the thread pool) — producing 10–15 identical lines per query. The function
+# itself cannot be changed here, so we cap its logger at WARNING so only genuine
+# warnings surface. This is intentional and documented.
+logging.getLogger("app.utils.column_utils").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
@@ -333,39 +330,57 @@ class ChartGenerator:
         return self._query_matches(query, self._BROAD_INTENT | self._PIVOT_INTENT | self._TABLE_EXPLICIT)
 
     def _augment_query(self, query: str) -> str:
+        """
+        Identical to the original, except the 'Numeric columns' context injected
+        for exploratory queries uses _meaningful_numeric_cols so the LLM never
+        sees TransactionID, CustomerID, Zip, etc. as plottable metrics.
+        """
         mode     = self._query_mode(query)
         quantity = self._extract_quantity(query)
         types    = self._detect_requested_chart_types(query)
-
+ 
         if mode == "exploratory":
-            num_cols = list(self.data.select_dtypes(include="number").columns)
-            cat_cols = list(self.data.select_dtypes(include=["object", "category"]).columns)
-            dt_cols  = [c for c in self.data.columns
-                        if "date" in c.lower() or "time" in c.lower()
-                        or str(self.data[c].dtype).startswith("datetime")]
-            col_ctx  = "\n\n[DATASET STRUCTURE — use this to generate a full dashboard]\n"
-            if dt_cols:    col_ctx += f"Date/time columns: {dt_cols}\n"
-            if num_cols:   col_ctx += f"Numeric columns: {num_cols}\n"
+            # FIX 1: filter ID columns out of the column context
+            num_cols = _meaningful_numeric_cols(self.data)
+            cat_cols = self.data.select_dtypes(
+                include=["object", "category"]
+            ).columns.tolist()
+            dt_cols = [
+                c for c in self.data.columns
+                if "date" in c.lower() or "time" in c.lower()
+                or str(self.data[c].dtype).startswith("datetime")
+            ]
+            col_ctx = "\n\n[DATASET STRUCTURE — use this to generate a full dashboard]\n"
+            if dt_cols:  col_ctx += f"Date/time columns: {dt_cols}\n"
+            if num_cols: col_ctx += f"Numeric columns: {num_cols}\n"
             if cat_cols:
                 useful = [c for c in cat_cols if self.data[c].nunique() <= 30]
                 if useful: col_ctx += f"Categorical columns: {useful}\n"
-            col_ctx += ("\nGenerate as many charts as makes sense for a complete dashboard. "
-                        "Cover time trends, category comparisons, and distributions.")
+            col_ctx += (
+                "\nGenerate as many charts as makes sense for a complete dashboard. "
+                "Cover time trends, category comparisons, and distributions."
+            )
             return query + col_ctx
-
+ 
         if quantity > 1 and len(types) == 1:
-            hint = (f"\n\n[QUANTITY INSTRUCTION]\nThe user explicitly requested {quantity} {types[0]} charts. "
-                    f"You MUST return exactly {quantity} charts of type '{types[0]}', "
-                    f"each using a DIFFERENT column or dimension. Do NOT return fewer.")
+            hint = (
+                f"\n\n[QUANTITY INSTRUCTION]\nThe user explicitly requested "
+                f"{quantity} {types[0]} charts. "
+                f"You MUST return exactly {quantity} charts of type '{types[0]}', "
+                f"each using a DIFFERENT column or dimension. Do NOT return fewer."
+            )
             return query + hint
-
+ 
         if self._needs_table(query):
-            return query + ("\n\n[TABLE INSTRUCTION]\nInclude up to 2 pivot tables. "
-                            "Each table must have a non-null 'index' and 'values' field and produce multiple rows.")
-
+            return query + (
+                "\n\n[TABLE INSTRUCTION]\nInclude up to 2 pivot tables. "
+                "Each table must have a non-null 'index' and 'values' field "
+                "and produce multiple rows."
+            )
+ 
         if self._query_matches(query, self._SCORECARD_EXPLICIT):
             return query + "\n\n[NOTE] The user also wants KPI scorecards shown above the charts."
-
+ 
         return query
 
     def _filter_table_configs(self, table_cfgs: list) -> list:
@@ -374,7 +389,7 @@ class ChartGenerator:
             if isinstance(cfg, dict):
                 filtered.append(cfg)
             elif cfg.type == "summary":
-                logger.info("Dropping scalar summary table %r — covered by scorecards", cfg.title)
+                logger.debug("Dropping scalar summary table %r — covered by scorecards", cfg.title)
             else:
                 filtered.append(cfg)
         return filtered
@@ -382,7 +397,7 @@ class ChartGenerator:
     @staticmethod
     def _check_cancelled(task_id: str, stage: str) -> None:
         if is_cancelled(task_id):
-            logger.info("Cancel flag detected at stage '%s' for task %s", stage, task_id)
+            logger.warning("Cancel flag detected at stage '%s' for task %s", stage, task_id)
             raise asyncio.CancelledError(f"Cancelled at stage: {stage}")
 
     async def generate(self, query: str, task_id: str = "") -> dict:
@@ -401,20 +416,29 @@ class ChartGenerator:
             EXECUTOR, _apply_date_filter, self.data, corrected_query,
         )
 
+        # ALWAYS define working components
         if filtered_data is not self.data:
             working_normalizer    = ChartConfigNormalizer(filtered_data)
             working_transformer   = DataTransformer(filtered_data)
             working_builder       = ChartBuilder(working_transformer)
             working_table_builder = TableBuilder(filtered_data)
             working_scorecard     = ScorecardBuilder(filtered_data)
-            working_col_dt_list   = list(zip(filtered_data.columns, filtered_data.dtypes))
-            logger.info("Using filtered dataset (%d rows) for %r", len(filtered_data), corrected_query[:60])
         else:
             working_normalizer    = self._normalizer
             working_builder       = self._builder
             working_table_builder = self._table_builder
             working_scorecard     = self._scorecard_builder
-            working_col_dt_list   = self._col_dt_list
+
+
+        # ALWAYS filter columns for LLM (independent of above)
+        def _filter_cols(df):
+            return [
+                (c, dt) for c, dt in zip(df.columns, df.dtypes)
+                if c not in df.select_dtypes(include="number").columns
+                or c in _meaningful_numeric_cols(df)
+            ]
+
+        working_col_dt_list = _filter_cols(filtered_data)
 
         effective_query = self._augment_query(corrected_query)
 
@@ -466,81 +490,145 @@ class ChartGenerator:
 
     def _process_sync(
         self,
-        llm_schema: LLMResponseSchema,
+        llm_schema,
         query: str,
-        working_data: pd.DataFrame | None = None,
+        working_data=None,
         working_normalizer=None,
         working_builder=None,
         working_table_builder=None,
         working_scorecard=None,
     ) -> dict:
+        """
+        Identical to the original _process_sync, with ONE change:
+ 
+        FIX 3 — After _build_charts + all fallback attempts, if `charts` is
+        still empty, raise ValueError immediately.  The caller (_run in routes.py)
+        catches this, writes {"status": "error", "error": "<message>"} to
+        _results, and the frontend shows a clear error toast instead of an
+        empty dashboard with no explanation.
+ 
+        The error message tells the operator WHY (no meaningful numeric columns
+        or all chart configs were invalid) so it's actionable.
+        """
+        import time, concurrent.futures
+        from app.utils.task_manager import is_cancelled
+ 
         logger.info("_process_sync START")
         t0 = time.perf_counter()
+ 
+        if working_data is None:          working_data          = self.data
+        if working_normalizer is None:    working_normalizer    = self._normalizer
+        if working_builder is None:       working_builder       = self._builder
+        if working_table_builder is None: working_table_builder = self._table_builder
+        if working_scorecard is None:     working_scorecard     = self._scorecard_builder
 
-        if working_data is None:           working_data          = self.data
-        if working_normalizer is None:     working_normalizer    = self._normalizer
-        if working_builder is None:        working_builder       = self._builder
-        if working_table_builder is None:  working_table_builder = self._table_builder
-        if working_scorecard is None:      working_scorecard     = self._scorecard_builder
-
+        # Compute once here — passed into _build_charts and both fallback methods
+        # so _meaningful_numeric_cols (which logs on every call) fires exactly once
+        # per query instead of once per chart config.
+        _num_cols_cache = _meaningful_numeric_cols(working_data)
+ 
         mode            = self._query_mode(query)
         requested_types = self._detect_requested_chart_types(query)
         quantity        = self._extract_quantity(query)
-
+ 
         show_scorecards = self._should_show_scorecards(query)
-        scorecards = working_scorecard.build_from_llm(llm_schema.scorecards) if show_scorecards else []
-
+        scorecards = (
+            working_scorecard.build_from_llm(llm_schema.scorecards)
+            if show_scorecards else []
+        )
+ 
         if mode == "specific":
             target   = requested_types[0]
             matching = [c for c in llm_schema.charts if c.type == target]
             if not matching:
-                fallback_cfg = self._fallback_chart_config(target, working_data)
+                fallback_cfg = self._fallback_chart_config(target, working_data, num_cols=_num_cols_cache)
                 if fallback_cfg:
                     from app.schemas.chart_schema import ChartConfigSchema
-                    try:   matching = [ChartConfigSchema.model_validate(fallback_cfg)]
-                    except Exception: pass
+                    try:
+                        matching = [ChartConfigSchema.model_validate(fallback_cfg)]
+                    except Exception:
+                        pass
             if not matching:
-                return {"scorecards": [], "charts": [{"type": "not_possible", "requested_type": target}], "tables": []}
+                return {
+                    "scorecards": [],
+                    "charts": [{"type": "not_possible", "requested_type": target}],
+                    "tables": [],
+                }
             llm_schema.charts = matching[:1]
             if not self._should_show_scorecards(query): scorecards = []
             if not self._should_show_tables(query):     llm_schema.tables = []
-
+ 
         elif mode == "multi":
             if quantity > 1 and len(requested_types) == 1:
                 target = requested_types[0]
                 kept   = [c for c in llm_schema.charts if c.type == target]
                 while len(kept) < quantity:
-                    extra = self._fallback_chart_config_for_index(target, len(kept), working_data)
-                    if extra is None: break
+                    extra = self._fallback_chart_config_for_index(
+                        target, len(kept), working_data, num_cols=_num_cols_cache
+                    )
+                    if extra is None:
+                        break
                     from app.schemas.chart_schema import ChartConfigSchema
-                    try:   kept.append(ChartConfigSchema.model_validate(extra))
-                    except Exception: break
+                    try:
+                        kept.append(ChartConfigSchema.model_validate(extra))
+                    except Exception:
+                        break
                 llm_schema.charts = kept[:quantity]
             else:
                 kept, covered = [], set()
                 for chart in llm_schema.charts:
                     if chart.type in requested_types and chart.type not in covered:
-                        kept.append(chart); covered.add(chart.type)
+                        kept.append(chart)
+                        covered.add(chart.type)
                 for t in requested_types:
                     if t not in covered:
-                        fc = self._fallback_chart_config(t, working_data)
+                        fc = self._fallback_chart_config(t, working_data, num_cols=_num_cols_cache)
                         if fc:
                             from app.schemas.chart_schema import ChartConfigSchema
-                            try:   kept.append(ChartConfigSchema.model_validate(fc))
-                            except Exception: pass
+                            try:
+                                kept.append(ChartConfigSchema.model_validate(fc))
+                            except Exception:
+                                pass
                 llm_schema.charts = kept
-
-        charts = self._build_charts(llm_schema, working_normalizer, working_builder, working_data)
+ 
+        charts = self._build_charts(
+            llm_schema,
+            working_normalizer,
+            working_builder,
+            working_data,
+            requested_types=requested_types,
+            num_cols=_num_cols_cache,
+        )
         charts = self._post_process_charts(charts, working_data)
 
+        # ── FIX 3: HARD STOP — never return a silent empty result ────────────
+        if not charts:
+            meaningful = _num_cols_cache   # already computed above — no extra call
+            if not meaningful:
+                raise ValueError(
+                    "This dataset has no plottable numeric columns. "
+                    "Columns like TransactionID, CustomerID, and Zip are "
+                    "identifiers, not metrics. Upload a dataset that contains "
+                    "real business metrics (e.g. Sales, Profit, Quantity)."
+                )
+            raise ValueError(
+                "No renderable charts could be built from the LLM configuration "
+                "or any fallback. This usually means the requested chart type is "
+                "incompatible with the available columns. "
+                f"Available numeric columns: {meaningful}."
+            )
+        # ── end FIX 3 ─────────────────────────────────────────────────────────
+ 
         table_cfgs = self._filter_table_configs(llm_schema.tables)[:2]
         tables     = working_table_builder.build_all(table_cfgs)
-        if not self._should_show_tables(query): tables = []
-
+        if not self._should_show_tables(query):
+            tables = []
+ 
         result = {"scorecards": scorecards, "charts": charts, "tables": tables}
         logger.info(
             "_process_sync END  mode=%s  charts=%d  tables=%d  scorecards=%d  elapsed=%.2fs",
-            mode, len(charts), len(tables), len(scorecards), time.perf_counter() - t0,
+            mode, len(charts), len(tables), len(scorecards),
+            time.perf_counter() - t0,
         )
         return result
 
@@ -561,10 +649,12 @@ class ChartGenerator:
                 seen.add(key); unique.append(c)
         return unique
 
-    def _build_charts(self, llm_schema, normalizer=None, builder=None, working_data=None) -> list:
+    def _build_charts(self, llm_schema, normalizer=None, builder=None, working_data=None, requested_types=None, num_cols=None) -> list:
         if normalizer is None:   normalizer   = self._normalizer
         if builder is None:      builder      = self._builder
         if working_data is None: working_data = self.data
+        # Use pre-computed list when available — avoids re-running the logged call
+        if num_cols is None:     num_cols     = _meaningful_numeric_cols(working_data)
 
         def process_one(chart_schema):
             cfg = normalizer.normalize(chart_schema)
@@ -572,54 +662,194 @@ class ChartGenerator:
 
         futures = [EXECUTOR.submit(process_one, cs) for cs in llm_schema.charts]
         charts  = [f.result() for f in concurrent.futures.as_completed(futures) if f.result()]
-        return charts or self._fallback_chart(working_data)
 
-    def _fallback_chart(self, df=None) -> list:
-        df = df if df is not None else self.data
-        num_cols = df.select_dtypes(include="number").columns
-        if not len(num_cols): return []
-        col = num_cols[0]; values = df[col].dropna()
-        if len(values) > 1000: values = values.sample(1000, random_state=0)
-        return [{"type": "histogram", "title": f"Distribution of {col}", "values": values.tolist(), "x_label": col, "layout_size": "medium"}]
+        if charts:
+            return charts
 
-    def _fallback_chart_config(self, chart_type: str, df=None) -> dict | None:
+        # Type-aware fallback
+        for chart_type in (requested_types or []):
+            fc = self._fallback_chart_config(chart_type, working_data, num_cols=num_cols)
+            if fc:
+                from app.schemas.chart_schema import ChartConfigSchema
+                try:
+                    schema = ChartConfigSchema.model_validate(fc)
+                    cfg = normalizer.normalize(schema)
+                    if cfg:
+                        chart = builder.build(cfg)
+                        if chart:
+                            logger.info("Type-aware fallback succeeded for %r", chart_type)
+                            return [chart]
+                except Exception:
+                    pass
+
+        return self._fallback_chart(working_data, num_cols=num_cols)
+
+    def _fallback_chart(self, df=None, num_cols=None) -> list:
         df = df if df is not None else self.data
-        num_cols = df.select_dtypes(include="number").columns
-        cat_cols = df.select_dtypes(include=["object", "category"]).columns
-        if chart_type == "histogram" and len(num_cols):
-            return {"type":"histogram","x":num_cols[0],"y":None,"color":None,"aggregation":"none","time_granularity":"none","layout_size":"medium","title":f"Distribution of {num_cols[0]}"}
-        if chart_type in ("area","line") and len(num_cols)>=2:
-            return {"type":chart_type,"x":num_cols[0],"y":num_cols[1],"color":None,"aggregation":"none","time_granularity":"none","layout_size":"large","title":f"{num_cols[1]} trend"}
-        if chart_type in ("pie","funnel","treemap") and len(cat_cols) and len(num_cols):
-            return {"type":chart_type,"x":cat_cols[0],"y":num_cols[0],"color":None,"aggregation":"sum","time_granularity":"none","layout_size":"medium","title":f"{num_cols[0]} by {cat_cols[0]}"}
-        if chart_type in ("bar","stacked_bar","grouped_bar","waterfall") and len(cat_cols) and len(num_cols):
-            return {"type":chart_type,"x":cat_cols[0],"y":num_cols[0],"color":None,"aggregation":"sum","time_granularity":"none","layout_size":"medium","title":f"{num_cols[0]} by {cat_cols[0]}"}
-        if chart_type == "scatter" and len(num_cols)>=2:
-            return {"type":"scatter","x":num_cols[0],"y":num_cols[1],"color":None,"aggregation":"none","time_granularity":"none","layout_size":"medium","title":f"{num_cols[0]} vs {num_cols[1]}"}
-        if chart_type == "bubble" and len(num_cols)>=3:
-            return {"type":"bubble","x":num_cols[0],"y":num_cols[1],"size":num_cols[2],"color":None,"aggregation":"none","time_granularity":"none","layout_size":"medium","title":f"{num_cols[0]} vs {num_cols[1]}"}
+        # FIX 1: _meaningful_numeric_cols — never returns TransactionID etc.
+        # Accept pre-computed list to avoid redundant logged calls.
+        if num_cols is None:
+            num_cols = _meaningful_numeric_cols(df)
+        if not num_cols:
+            logger.error(
+                "_fallback_chart: no meaningful numeric columns in dataset — "
+                "cannot produce any chart"
+            )
+            return []  # pipeline will raise in _process_sync
+        def _score_column(df, col):
+            s = df[col].dropna()
+
+            # 1. Must have enough variation
+            uniq = s.nunique()
+            if uniq < 5:
+                return -1
+
+            # 2. Prefer wider spread (more informative)
+            spread = s.max() - s.min() if len(s) else 0
+
+            # 3. Penalize low variance (flat columns)
+            std = s.std() if len(s) > 1 else 0
+
+            # 4. Penalize columns that look like IDs (just in case)
+            # (safety layer even though you filtered already)
+            if uniq / len(s) > 0.95:
+                return -2
+
+            return spread + std
+
+
+        scored = [(col, _score_column(df, col)) for col in num_cols]
+        scored = [c for c in scored if c[1] > 0]
+
+        if not scored:
+            return []
+
+        col = sorted(scored, key=lambda x: x[1], reverse=True)[0][0]
+
+        values = df[col].dropna()
+        if len(values) > 1000:
+            values = values.sample(1000, random_state=0)
+        logger.info("_fallback_chart: using column %r", col)
+        return [{
+            "type":        "histogram",
+            "title":       f"Distribution of {col}",
+            "values":      values.tolist(),
+            "x_label":     col,
+            "layout_size": "medium",
+        }]
+
+    def _fallback_chart_config(self, chart_type: str, df=None, num_cols=None) -> dict | None:
+        df = df if df is not None else self.data
+        # FIX 1: use filtered list — never includes ID columns
+        # Accept pre-computed list to avoid redundant logged calls.
+        if num_cols is None:
+            num_cols = _meaningful_numeric_cols(df)
+        cat_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+ 
+        if chart_type == "histogram" and num_cols:
+            return {
+                "type": "histogram", "x": num_cols[0], "y": None,
+                "color": None, "aggregation": "none",
+                "time_granularity": "none", "layout_size": "medium",
+                "title": f"Distribution of {num_cols[0]}",
+            }
+        if chart_type in ("area", "line") and len(num_cols) >= 2:
+            return {
+                "type": chart_type, "x": num_cols[0], "y": num_cols[1],
+                "color": None, "aggregation": "none",
+                "time_granularity": "none", "layout_size": "large",
+                "title": f"{num_cols[1]} trend",
+            }
+        if chart_type in ("pie", "funnel", "treemap") and cat_cols and num_cols:
+            return {
+                "type": chart_type, "x": cat_cols[0], "y": num_cols[0],
+                "color": None, "aggregation": "sum",
+                "time_granularity": "none", "layout_size": "medium",
+                "title": f"{num_cols[0]} by {cat_cols[0]}",
+            }
+        if chart_type in ("bar", "stacked_bar", "grouped_bar", "waterfall") and cat_cols and num_cols:
+            return {
+                "type": chart_type, "x": cat_cols[0], "y": num_cols[0],
+                "color": None, "aggregation": "sum",
+                "time_granularity": "none", "layout_size": "medium",
+                "title": f"{num_cols[0]} by {cat_cols[0]}",
+            }
+        if chart_type == "scatter" and len(num_cols) >= 2:
+            return {
+                "type": "scatter", "x": num_cols[0], "y": num_cols[1],
+                "color": None, "aggregation": "none",
+                "time_granularity": "none", "layout_size": "medium",
+                "title": f"{num_cols[0]} vs {num_cols[1]}",
+            }
+        if chart_type == "bubble" and len(num_cols) >= 3:
+            return {
+                "type": "bubble", "x": num_cols[0], "y": num_cols[1],
+                "size": num_cols[2], "color": None, "aggregation": "none",
+                "time_granularity": "none", "layout_size": "medium",
+                "title": f"{num_cols[0]} vs {num_cols[1]}",
+            }
         if chart_type == "heatmap":
-            usable_cat = [c for c in cat_cols if 2 <= df[c].nunique() <= 25]
-            if len(usable_cat)>=2 and len(num_cols)>=1:
-                return {"type":"heatmap","x":usable_cat[0],"y":usable_cat[1],"z":num_cols[0],"color":None,"aggregation":"mean","time_granularity":"none","layout_size":"large","title":f"{num_cols[0]} heatmap"}
+            usable_cat = [
+                c for c in cat_cols
+                if 2 <= df[c].nunique() <= 25
+                and c not in num_cols   # use already-computed list
+            ]
+            if len(usable_cat) >= 2 and num_cols:
+                return {
+                    "type": "heatmap", "x": usable_cat[0], "y": usable_cat[1],
+                    "z": num_cols[0], "color": None, "aggregation": "mean",
+                    "time_granularity": "none", "layout_size": "large",
+                    "title": f"{num_cols[0]} heatmap",
+                }
             return None
-        if chart_type == "box" and len(num_cols):
-            return {"type":"box","x":num_cols[0],"y":num_cols[0],"color":None,"aggregation":"none","time_granularity":"none","layout_size":"medium","title":f"Distribution of {num_cols[0]}"}
+        if chart_type == "box" and num_cols:
+            return {
+                "type": "box", "x": num_cols[0], "y": num_cols[0],
+                "color": None, "aggregation": "none",
+                "time_granularity": "none", "layout_size": "medium",
+                "title": f"Distribution of {num_cols[0]}",
+            }
         return None
 
-    def _fallback_chart_config_for_index(self, chart_type: str, index: int, df=None) -> dict | None:
+
+    def _fallback_chart_config_for_index(
+        self, chart_type: str, index: int, df=None, num_cols=None
+    ) -> dict | None:
         df = df if df is not None else self.data
-        num_cols = list(df.select_dtypes(include="number").columns)
-        cat_cols = list(df.select_dtypes(include=["object","category"]).columns)
+        # FIX 1: filtered list — accept pre-computed to avoid redundant logged calls.
+        if num_cols is None:
+            num_cols = _meaningful_numeric_cols(df)
+        cat_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+ 
         if chart_type == "histogram" and index < len(num_cols):
             col = num_cols[index]
-            return {"type":"histogram","x":col,"y":None,"color":None,"aggregation":"none","time_granularity":"none","layout_size":"medium","title":f"Distribution of {col}"}
+            return {
+                "type": "histogram", "x": col, "y": None,
+                "color": None, "aggregation": "none",
+                "time_granularity": "none", "layout_size": "medium",
+                "title": f"Distribution of {col}",
+            }
         if chart_type == "box" and index < len(num_cols):
             col = num_cols[index]
-            return {"type":"box","x":col,"y":col,"color":None,"aggregation":"none","time_granularity":"none","layout_size":"medium","title":f"Distribution of {col}"}
-        if chart_type in ("bar","stacked_bar","grouped_bar") and cat_cols and index < len(num_cols):
-            return {"type":chart_type,"x":cat_cols[0],"y":num_cols[index],"color":None,"aggregation":"sum","time_granularity":"none","layout_size":"medium","title":f"{num_cols[index]} by {cat_cols[0]}"}
-        if chart_type in ("line","area") and len(num_cols)>=2:
-            col = num_cols[min(index+1, len(num_cols)-1)]
-            return {"type":chart_type,"x":num_cols[0],"y":col,"color":None,"aggregation":"none","time_granularity":"none","layout_size":"large","title":f"{col} trend"}
+            return {
+                "type": "box", "x": col, "y": col,
+                "color": None, "aggregation": "none",
+                "time_granularity": "none", "layout_size": "medium",
+                "title": f"Distribution of {col}",
+            }
+        if chart_type in ("bar", "stacked_bar", "grouped_bar") and cat_cols and index < len(num_cols):
+            return {
+                "type": chart_type, "x": cat_cols[0], "y": num_cols[index],
+                "color": None, "aggregation": "sum",
+                "time_granularity": "none", "layout_size": "medium",
+                "title": f"{num_cols[index]} by {cat_cols[0]}",
+            }
+        if chart_type in ("line", "area") and len(num_cols) >= 2:
+            col = num_cols[min(index + 1, len(num_cols) - 1)]
+            return {
+                "type": chart_type, "x": num_cols[0], "y": col,
+                "color": None, "aggregation": "none",
+                "time_granularity": "none", "layout_size": "large",
+                "title": f"{col} trend",
+            }
         return self._fallback_chart_config(chart_type, df)

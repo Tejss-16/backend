@@ -1,15 +1,4 @@
 # app/pipeline/llm_client.py
-#
-# FIX: Typo correction — before the main chart-config LLM call, the raw user
-#      query is passed through a lightweight correction step that:
-#        1. Fixes spelling mistakes  ("hsitogram" → "histogram")
-#        2. Normalises chart-type aliases  ("column chart" → "bar")
-#        3. Expands shorthand  ("dash" → "dashboard")
-#        4. Preserves all intent — it never removes numbers, column names, or
-#           filter conditions from the query
-#      The corrected query is logged so the dev can see what changed.
-#      If the correction call fails for any reason the original query is used
-#      transparently (fail-safe, no user-visible error).
 
 import json
 import os
@@ -139,6 +128,10 @@ box           — statistical spread / outlier detection for a numeric column
 heatmap       — two-dimensional matrix of values (x=category, y=category, z=numeric)
 bubble        — scatter with a third dimension encoded as bubble size (size=numeric column)
 funnel        — sequential stage drop-off (x=stage label, y=numeric count/rate)
+               ⚠ FUNNEL PRE-CONDITION: ONLY use funnel when x is a true stage/step
+               label column (e.g. "Stage", "Step", "Phase", "Pipeline", "Status",
+               "Funnel Stage"). A date, region, product, or category column is NEVER
+               a valid funnel x-axis. If no stage-label column exists → use bar or line.
 treemap       — hierarchical proportions (x=category, y=numeric)
 waterfall     — cumulative change across ordered categories (x=category, y=numeric delta)
 stacked_bar   — multi-series bars stacked, showing composition
@@ -158,8 +151,18 @@ CHART SELECTION RULES
    - Three-variable relationship → bubble
    - Distributions              → histogram or box
    - Two-dim matrix / cross-tab → heatmap
-   - Sequential stage funnel    → funnel
+   - Sequential stage funnel    → funnel (ONLY if a genuine stage/step column exists)
    - Cumulative change          → waterfall
+
+3a. FUNNEL OVERRIDE RULE (highest priority for funnel requests):
+    If the user requests a funnel chart but the dataset has NO column whose name
+    or values clearly indicate sequential pipeline stages, you MUST substitute
+    a semantically correct chart instead:
+      - If a date/time column exists → use "line" (time trend is more meaningful)
+      - If only category columns exist → use "bar" (category comparison)
+      - If only numeric columns exist → use "histogram" (distribution)
+    In all substitution cases, set the title to accurately describe what is shown.
+    NEVER pair a date column as x with a numeric column as y for a funnel.
 
 3. For EXPLORATORY queries, think like an analyst building a full dashboard:
    - If a date column exists → always include at least one line or area chart over time
@@ -190,7 +193,8 @@ CHART SELECTION RULES
 SPECIAL FIELD RULES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 - histogram: y must be null
-- heatmap:   z must be a numeric column name (the value to aggregate in the matrix)
+- heatmap:   x and y must be CATEGORICAL columns, never identifier/ID columns (Row ID, Order ID, etc.)
+             z must be a proper numeric metric column (never an ID column)
 - bubble:    size must be a numeric column name; x and y must also be numeric
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -246,6 +250,8 @@ QUALITY CHECKLIST (apply before finalising output)
 ✓ histogram y is always null
 ✓ heatmap has a z field with a numeric column
 ✓ bubble has a size field with a numeric column
+✓ funnel x column contains genuine stage/step labels — NOT dates, NOT regions, NOT products
+✓ If user requests funnel but no stage column exists, chart type is substituted (line/bar/histogram)
 ✓ Quantity requests return EXACTLY the requested number of charts
 ✓ Scorecards use mean for percentages/ratings, sum for revenue/counts
 ✓ Scorecard labels are human-readable business terms

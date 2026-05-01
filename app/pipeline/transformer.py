@@ -1,33 +1,6 @@
 # app/pipeline/transformer.py
-#
-# FIXES in this version:
-#
-# FIX A (CRITICAL — sorts bug): _safe_sort() previously called
-#   df.sort_values(by=col) on the date column AFTER it had already been
-#   converted to strings via df[x] = df[x].astype(str).  String-sorting
-#   "1/6/2014" < "11/17/2014" < "11/4/2014" — completely wrong order.
-#   Fix: sort BEFORE the astype(str) conversion, while the column is still
-#   datetime.  A dedicated _sort_by_datetime() helper parses the column
-#   on-the-fly if needed so sorting is always chronological.
-#
-# FIX B (CRITICAL — unsorted after fill_gaps): _fill_gaps() builds a new
-#   DataFrame via reindex/concat but does not guarantee row order.  The
-#   resulting DataFrame can have dates out of order even after asfreq.
-#   Fix: always sort by the date column at the END of _fill_gaps().
-#
-# FIX C (CORRECTNESS): _granularise_inplace() used Period.to_timestamp()
-#   which pins every period to its START date regardless of the original
-#   day — this is correct, but the downstream astype(str) then formatted
-#   the timestamp as a full ISO string ("2014-01-01 00:00:00") rather than
-#   a readable date.  Fix: format datetime columns as "YYYY-MM-DD" strings,
-#   not full ISO timestamps.
-#
-# FIX D (ROBUSTNESS): _is_time() now also detects columns whose name
-#   strongly hints at a date ("date", "time", "period", "year", "month")
-#   even if the sample parse-rate is slightly below the 0.80 threshold,
-#   using a relaxed 0.5 threshold for name-hinted columns.  This prevents
-#   date columns with a few dirty values from being treated as categories.
 
+import warnings
 import pandas as pd
 
 _TIME_FREQ = {"month": "MS", "year": "YS", "week": "W-MON", "day": "D"}
@@ -45,7 +18,7 @@ class DataTransformer:
         x, y    = cfg["x"], cfg["y"]
         agg     = cfg["aggregation"]
         color   = cfg["color"]
-        is_time = self._is_time(x, cfg["type"])
+        is_time = cfg["type"] != "heatmap" and self._is_time(x, cfg["type"])
 
         if cfg["type"] == "histogram":
             return self._source[[x]].dropna()
@@ -57,8 +30,10 @@ class DataTransformer:
         if cfg["type"] == "scatter":
             return self._source[[x, y]].drop_duplicates()
 
-        real_cols = [c for c in ({x, y} | ({color} if color else set()))
-                     if c in self._source.columns]
+        z = cfg.get("z")
+
+        real_cols = [c for c in ({x, y, z} | ({color} if color else set()))
+                    if c and c in self._source.columns]
         df = self._source[real_cols].copy()
 
         synthetic: pd.Series | None = cfg.get("_synthetic")
@@ -69,9 +44,14 @@ class DataTransformer:
             self._parse_time_inplace(df, x)
             self._granularise_inplace(df, x, cfg["time_granularity"])
 
-        group_keys = [x] if not color else [x, color]
+        if cfg["type"] == "heatmap":
+            group_keys = [x, y]
+        else:
+            group_keys = [x] if not color else [x, color]
+
         if agg != "none":
-            df = df.groupby(group_keys)[y].agg(agg).reset_index()
+            target = z if cfg["type"] == "heatmap" else y
+            df = df.groupby(group_keys)[target].agg(agg).reset_index()
 
         if is_time:
             df = self._fill_gaps(df, x, y, cfg["time_granularity"], color=color)
@@ -84,7 +64,8 @@ class DataTransformer:
                 else:
                     df[y] = df[y].rolling(2, min_periods=1).mean()
         else:
-            df = self._limit_categories(df, cfg, x, y)
+            if cfg["type"] != "heatmap":
+                df = self._limit_categories(df, cfg, x, y)
 
         # FIX A: sort while column is still datetime (before string conversion)
         df = self._sort_chronologically(df, x)
@@ -115,8 +96,11 @@ class DataTransformer:
             self._time_cache[col] = False
             return False
 
-        # Try parsing as datetime
-        parsed     = pd.to_datetime(series, errors="coerce")
+        # FIX 1: suppress dateutil warning during the probe parse
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            parsed = pd.to_datetime(series, errors="coerce")
+
         total      = max(len(series), 1)
         parse_rate = parsed.notna().sum() / total
 
@@ -131,7 +115,42 @@ class DataTransformer:
 
     @staticmethod
     def _parse_time_inplace(df: pd.DataFrame, col: str) -> None:
-        if not pd.api.types.is_datetime64_any_dtype(df[col]):
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            return  # already parsed
+
+        # FIX 3: probe the full column directly (no astype(str) conversion)
+        # and reuse the parsed result — avoids parsing the column twice.
+        FORMATS_TO_TRY = [
+            "%Y-%m-%d",
+            "%m/%d/%Y",
+            "%d/%m/%Y",
+            "%Y/%m/%d",
+            "%d-%m-%Y",
+            "%m-%d-%Y",
+            "%Y-%m-%d %H:%M:%S",
+            "%m/%d/%Y %H:%M:%S",
+            "%d/%m/%Y %H:%M:%S",
+            "%b %d, %Y",   # "Jan 06, 2014"
+            "%B %d, %Y",   # "January 06, 2014"
+            "%Y%m%d",      # "20140106"
+        ]
+
+        non_null_count = max(df[col].notna().sum(), 1)
+
+        for fmt in FORMATS_TO_TRY:
+            try:
+                parsed = pd.to_datetime(df[col], format=fmt, errors="coerce")
+                if parsed.notna().sum() / non_null_count >= 0.80:
+                    df[col] = parsed  # reuse — no second parse needed
+                    return
+            except Exception:
+                continue
+
+        # No single format matched well — fall back to mixed/dateutil inference.
+        # FIX 1 (shared): suppress the UserWarning that pandas emits when it
+        # cannot infer a single format and falls back to dateutil per-element.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
             df[col] = pd.to_datetime(df[col], errors="coerce")
 
     @staticmethod
@@ -200,7 +219,11 @@ class DataTransformer:
         """
         Sort df by col chronologically.  Works whether col is datetime or string.
         If col is a string that looks like dates, parse temporarily for sorting.
-        Returns a sorted copy (or the original if sorting fails).
+
+        FIX 2: the original version reassigned series.values (original order)
+        back onto the sorted DataFrame — misaligning dates and row data.
+        Now uses a temporary __sort_key__ column instead, same pattern as
+        _sort_chronologically(), so original column values are never touched.
         """
         if col not in df.columns:
             return df
@@ -208,10 +231,15 @@ class DataTransformer:
             series = df[col]
             if pd.api.types.is_datetime64_any_dtype(series):
                 return df.sort_values(by=col, ignore_index=True)
-            # Try parsing as datetime for proper chronological sort
-            parsed = pd.to_datetime(series, errors="coerce")
+            # FIX 1 (shared): suppress dateutil warning during the probe parse
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                parsed = pd.to_datetime(series, errors="coerce")
             if parsed.notna().mean() >= 0.5:
-                return df.assign(**{col: parsed}).sort_values(by=col, ignore_index=True).assign(**{col: series.values})
+                # FIX 2: sort via a temp key — never overwrite the original values
+                tmp = df.copy()
+                tmp["__sort_key__"] = parsed
+                return tmp.sort_values("__sort_key__", ignore_index=True).drop(columns="__sort_key__")
             return df.sort_values(by=col, ignore_index=True)
         except Exception:
             return df
@@ -230,7 +258,10 @@ class DataTransformer:
             if pd.api.types.is_datetime64_any_dtype(df[col]):
                 return df.sort_values(by=col, ignore_index=True)
             # Fallback: try parsing on the fly
-            parsed = pd.to_datetime(df[col], errors="coerce")
+            # FIX 1 (shared): suppress dateutil warning
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                parsed = pd.to_datetime(df[col], errors="coerce")
             if parsed.notna().mean() >= 0.5:
                 tmp = df.copy()
                 tmp["__sort_key__"] = parsed
