@@ -46,6 +46,23 @@ _NUMBER_WORDS = {
     "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
 }
 
+# Maximum charts returned per query mode.
+# Tune these constants to control dashboard density without touching logic.
+CHART_MAX_EXPLORATORY = 12   # open-ended: "dashboard", "analyze", "overview"
+CHART_MAX_ALL_OF_TYPE = 10   # wildcard:   "all possible bar charts"
+CHART_MAX_MULTI       = 8    # named set:  "histogram and pie and scatter"
+# "specific" mode always returns exactly 1 — no cap needed
+
+TABLE_MAX     = 5   # max tables in any single response
+SCORECARD_MAX = 8   # max scorecards in any single response (mirrors scorecard.py _SCORECARD_MAX)
+
+def _over_limit_msg(kind: str, requested: int, limit: int) -> str:
+    """Human-readable message shown when user requests more than the allowed limit."""
+    return (
+        f"Showing {limit} {kind} (you requested {requested}, but the limit is {limit}). "
+        f"If you need different ones, ask for specific {kind} in your next query."
+    )
+
 # ─────────────────────────────────────────────────────────────────────────────
 # DATE RANGE EXTRACTOR
 # ─────────────────────────────────────────────────────────────────────────────
@@ -286,20 +303,53 @@ class ChartGenerator:
 
     @staticmethod
     def _extract_quantity(query: str) -> int:
+        """
+        Returns:
+          -1  → "all / every / possible / any" wildcard (generate as many as data allows)
+          n>0 → exact count requested
+          1   → default (no quantity word found)
+        """
         q = query.lower()
-        digit_match = re.search(r'\b(\d+)\s+(?:' + '|'.join(
+        chart_type_pattern = '|'.join(
             re.escape(k) for k in sorted(ChartGenerator._CHART_TYPE_KEYWORDS, key=len, reverse=True)
-        ) + r')', q)
+        )
+        # "all bar charts", "every possible histogram", "all possible bar charts"
+        wildcard_match = re.search(
+            r'\b(?:all|every|any)(?:\s+possible)?\s+(?:' + chart_type_pattern + r')',
+            q,
+        )
+        if wildcard_match:
+            return -1  # sentinel: generate as many as the data supports
+
+        digit_match = re.search(r'\b(\d+)\s+(?:' + chart_type_pattern + r')', q)
         if digit_match:
             return max(1, int(digit_match.group(1)))
         word_pattern = '|'.join(re.escape(w) for w in _NUMBER_WORDS)
         word_match = re.search(
-            r'\b(' + word_pattern + r')\s+(?:' + '|'.join(
-                re.escape(k) for k in sorted(ChartGenerator._CHART_TYPE_KEYWORDS, key=len, reverse=True)
-            ) + r')', q
+            r'\b(' + word_pattern + r')\s+(?:' + chart_type_pattern + r')',
+            q,
         )
         if word_match:
             return _NUMBER_WORDS.get(word_match.group(1), 1)
+        return 1
+
+    @staticmethod
+    def _extract_non_chart_quantity(query: str, keyword: str) -> int:
+        """
+        Extract a numeric quantity for non-chart items like tables or scorecards.
+        e.g. "give 3 tables" → 3,  "show five scorecards" → 5
+        Returns 1 if no number found.
+        """
+        q = query.lower()
+        # digit: "3 tables"
+        m = re.search(r'\b(\d+)\s+' + re.escape(keyword), q)
+        if m:
+            return max(1, int(m.group(1)))
+        # word: "three tables"
+        word_pattern = '|'.join(re.escape(w) for w in _NUMBER_WORDS)
+        m = re.search(r'\b(' + word_pattern + r')\s+' + re.escape(keyword), q)
+        if m:
+            return _NUMBER_WORDS.get(m.group(1), 1)
         return 1
 
     def _detect_requested_chart_types(self, query: str) -> list[str]:
@@ -314,16 +364,32 @@ class ChartGenerator:
     def _query_mode(self, query: str) -> str:
         types    = self._detect_requested_chart_types(query)
         quantity = self._extract_quantity(query)
-        if len(types) == 0:   return "exploratory"
+        # Check for table-only / scorecard-only BEFORE falling to exploratory,
+        # so "give 2 tables" never becomes an exploratory chart dump.
+        if len(types) == 0:
+            if self._query_matches(query, self._TABLE_EXPLICIT):      return "tables_only"
+            if self._query_matches(query, self._SCORECARD_EXPLICIT):  return "scorecards_only"
+            return "exploratory"
+        if quantity == -1:                    return "all_of_type"
         if len(types) == 1 and quantity == 1: return "specific"
         return "multi"
 
     def _should_show_scorecards(self, query: str) -> bool:
+        mode = self._query_mode(query)
+        if mode == "scorecards_only":                          return True
+        if mode == "tables_only":                              return False
+        if mode in ("specific", "multi", "all_of_type"):
+            return self._query_matches(query, self._SCORECARD_EXPLICIT)
         if self._query_matches(query, self._SCORECARD_EXPLICIT): return True
         return self._query_matches(query, self._BROAD_INTENT | self._SUMMARY_INTENT)
 
     def _should_show_tables(self, query: str) -> bool:
-        if self._query_matches(query, self._TABLE_EXPLICIT): return True
+        mode = self._query_mode(query)
+        if mode == "tables_only":                              return True
+        if mode == "scorecards_only":                          return False
+        if mode in ("specific", "multi", "all_of_type"):
+            return self._query_matches(query, self._TABLE_EXPLICIT)
+        if self._query_matches(query, self._TABLE_EXPLICIT):   return True
         return self._query_matches(query, self._BROAD_INTENT | self._PIVOT_INTENT | self._SUMMARY_INTENT)
 
     def _needs_table(self, query: str) -> bool:
@@ -339,6 +405,22 @@ class ChartGenerator:
         quantity = self._extract_quantity(query)
         types    = self._detect_requested_chart_types(query)
  
+        if mode == "tables_only":
+            n = quantity if quantity > 1 else 2
+            return query + (
+                f"\n\n[TABLE INSTRUCTION]\nThe user wants ONLY tables — no charts, no scorecards. "
+                f"Return exactly {n} pivot table(s), each grouping by a different meaningful "
+                f"categorical column and aggregating a real numeric metric. "
+                f"Return an empty 'charts' array and empty 'scorecards' array."
+            )
+
+        if mode == "scorecards_only":
+            return query + (
+                "\n\n[SCORECARD INSTRUCTION]\nThe user wants ONLY KPI scorecards — no charts, no tables. "
+                "Return 5–8 meaningful scorecards covering different business dimensions. "
+                "Return an empty 'charts' array and empty 'tables' array."
+            )
+
         if mode == "exploratory":
             # FIX 1: filter ID columns out of the column context
             num_cols = _meaningful_numeric_cols(self.data)
@@ -368,6 +450,22 @@ class ChartGenerator:
                 f"{quantity} {types[0]} charts. "
                 f"You MUST return exactly {quantity} charts of type '{types[0]}', "
                 f"each using a DIFFERENT column or dimension. Do NOT return fewer."
+            )
+            return query + hint
+
+        if quantity == -1 and len(types) >= 1:
+            # "all possible bar charts" — generate as many distinct charts of
+            # the requested type(s) as the data meaningfully supports.
+            type_list = types if len(types) > 1 else [types[0]]
+            type_str  = " and ".join(f"'{t}'" for t in type_list)
+            hint = (
+                f"\n\n[ALL INSTRUCTION]\nThe user wants ALL possible {type_str} chart(s) "
+                f"that can be meaningfully built from this dataset. "
+                f"Generate one chart for EACH different combination of columns that "
+                f"produces a useful, non-redundant {type_str} chart. "
+                f"Only include charts that are genuinely informative — skip meaningless ones. "
+                f"Return ONLY charts of type(s): {type_list}. "
+                f"Do NOT add scorecards or tables. Do NOT return other chart types."
             )
             return query + hint
  
@@ -449,6 +547,68 @@ class ChartGenerator:
 
         self._check_cancelled(task_id, "pre-llm")
 
+        mode = self._query_mode(corrected_query)
+
+        # ── tables_only: skip get_chart_config entirely ───────────────────────
+        # Going through get_chart_config would trigger the "charts must be
+        # non-empty" schema validator and waste 2–3 retry/repair rounds.
+        if mode == "tables_only":
+            requested  = self._extract_non_chart_quantity(corrected_query, "table")
+            requested  = self._extract_non_chart_quantity(corrected_query, "tables") if requested == 1 else requested
+            capped     = min(requested, TABLE_MAX)
+            warning    = _over_limit_msg("tables", requested, TABLE_MAX) if requested > TABLE_MAX else None
+            logger.info("tables_only mode — calling get_table_config directly (requested=%d, max=%d)", requested, capped)
+            raw_table_cfgs = await self._llm.get_table_config(
+                working_col_dt_list, sample, stats, corrected_query,
+                max_tables=capped,
+            )
+            from app.schemas.chart_schema import TableConfigSchema
+            from pydantic import ValidationError
+            validated = []
+            for raw in raw_table_cfgs:
+                try:
+                    validated.append(TableConfigSchema.model_validate(raw))
+                except (ValidationError, Exception) as exc:
+                    logger.warning("Table config validation failed: %s", exc)
+
+            tables = working_table_builder.build_all(validated[:capped])
+            result = {"scorecards": [], "charts": [], "tables": tables}
+            if warning:
+                result["warning"] = warning
+            logger.info("tables_only completed: %d table(s) built", len(tables))
+            self._check_cancelled(task_id, "post-processing")
+            _result_cache.set(key, result)
+            return result
+
+        # ── scorecards_only: skip get_chart_config entirely ───────────────────
+        if mode == "scorecards_only":
+            requested = self._extract_non_chart_quantity(corrected_query, "scorecard")
+            requested = self._extract_non_chart_quantity(corrected_query, "scorecards") if requested == 1 else requested
+            capped    = min(requested if requested > 1 else SCORECARD_MAX, SCORECARD_MAX)
+            warning   = _over_limit_msg("scorecards", requested, SCORECARD_MAX) if requested > SCORECARD_MAX else None
+            logger.info("scorecards_only mode — calling get_scorecard_config directly (max=%d)", capped)
+            raw_scorecard_cfgs = await self._llm.get_scorecard_config(
+                working_col_dt_list, sample, stats, corrected_query,
+                max_scorecards=capped,
+            )
+            from app.schemas.chart_schema import ScorecardConfigSchema
+            from pydantic import ValidationError
+            validated_sc = []
+            for raw in raw_scorecard_cfgs:
+                try:
+                    validated_sc.append(ScorecardConfigSchema.model_validate(raw))
+                except (ValidationError, Exception) as exc:
+                    logger.warning("Scorecard config validation failed: %s", exc)
+            scorecards = working_scorecard.build_from_llm(validated_sc[:capped])
+            result = {"scorecards": scorecards, "charts": [], "tables": []}
+            if warning:
+                result["warning"] = warning
+            logger.info("scorecards_only completed: %d scorecard(s) built", len(scorecards))
+            self._check_cancelled(task_id, "post-processing")
+            _result_cache.set(key, result)
+            return result
+        # ── end short-circuits ────────────────────────────────────────────────
+
         try:
             llm_schema = await asyncio.wait_for(
                 self._llm.get_chart_config(working_col_dt_list, sample, stats, effective_query),
@@ -463,7 +623,8 @@ class ChartGenerator:
         if self._should_show_tables(corrected_query) and not llm_schema.tables:
             logger.info("No tables from main LLM — requesting separately")
             raw_table_cfgs = await self._llm.get_table_config(
-                working_col_dt_list, sample, stats, corrected_query
+                working_col_dt_list, sample, stats, corrected_query,
+                max_tables=2,
             )
             if raw_table_cfgs:
                 from app.schemas.chart_schema import TableConfigSchema
@@ -537,6 +698,27 @@ class ChartGenerator:
             if show_scorecards else []
         )
  
+        if mode == "tables_only":
+            # User asked only for tables — skip charts and scorecards entirely.
+            n          = quantity if quantity > 1 else 2
+            table_cfgs = self._filter_table_configs(llm_schema.tables)[:n]
+            tables     = working_table_builder.build_all(table_cfgs)
+            result = {"scorecards": [], "charts": [], "tables": tables}
+            logger.info(
+                "_process_sync END  mode=tables_only  tables=%d  elapsed=%.2fs",
+                len(tables), time.perf_counter() - t0,
+            )
+            return result
+
+        if mode == "scorecards_only":
+            # User asked only for scorecards — skip charts and tables entirely.
+            result = {"scorecards": scorecards, "charts": [], "tables": []}
+            logger.info(
+                "_process_sync END  mode=scorecards_only  scorecards=%d  elapsed=%.2fs",
+                len(scorecards), time.perf_counter() - t0,
+            )
+            return result
+
         if mode == "specific":
             target   = requested_types[0]
             matching = [c for c in llm_schema.charts if c.type == target]
@@ -590,6 +772,26 @@ class ChartGenerator:
                             except Exception:
                                 pass
                 llm_schema.charts = kept
+
+        elif mode == "all_of_type":
+            # Keep only charts of the requested type(s); strip everything else.
+            # The LLM was already instructed (via _augment_query) to generate all
+            # meaningful variants — here we just enforce the type filter and ensure
+            # scorecards / tables are cleared.
+            kept = [c for c in llm_schema.charts if c.type in requested_types]
+            if not kept:
+                # LLM didn't comply — build one fallback per requested type
+                from app.schemas.chart_schema import ChartConfigSchema
+                for t in requested_types:
+                    fc = self._fallback_chart_config(t, working_data, num_cols=_num_cols_cache)
+                    if fc:
+                        try:
+                            kept.append(ChartConfigSchema.model_validate(fc))
+                        except Exception:
+                            pass
+            llm_schema.charts  = kept
+            llm_schema.tables  = []   # user only asked for charts
+            scorecards         = []   # user only asked for charts
  
         charts = self._build_charts(
             llm_schema,
@@ -601,7 +803,25 @@ class ChartGenerator:
         )
         charts = self._post_process_charts(charts, working_data)
 
+        # ── Per-mode chart cap ────────────────────────────────────────────────
+        chart_warning = None
+        if mode == "exploratory" and len(charts) > CHART_MAX_EXPLORATORY:
+            logger.info("Capping exploratory charts %d → %d", len(charts), CHART_MAX_EXPLORATORY)
+            chart_warning = _over_limit_msg("charts", len(charts), CHART_MAX_EXPLORATORY)
+            charts = charts[:CHART_MAX_EXPLORATORY]
+        elif mode == "all_of_type" and len(charts) > CHART_MAX_ALL_OF_TYPE:
+            logger.info("Capping all_of_type charts %d → %d", len(charts), CHART_MAX_ALL_OF_TYPE)
+            chart_warning = _over_limit_msg("charts", len(charts), CHART_MAX_ALL_OF_TYPE)
+            charts = charts[:CHART_MAX_ALL_OF_TYPE]
+        elif mode == "multi" and len(charts) > CHART_MAX_MULTI:
+            logger.info("Capping multi charts %d → %d", len(charts), CHART_MAX_MULTI)
+            chart_warning = _over_limit_msg("charts", len(charts), CHART_MAX_MULTI)
+            charts = charts[:CHART_MAX_MULTI]
+        # ── end cap ───────────────────────────────────────────────────────────
+
         # ── FIX 3: HARD STOP — never return a silent empty result ────────────
+        # (tables_only and scorecards_only return early above — this guard is
+        #  only reached by chart-producing modes)
         if not charts:
             meaningful = _num_cols_cache   # already computed above — no extra call
             if not meaningful:
@@ -625,6 +845,8 @@ class ChartGenerator:
             tables = []
  
         result = {"scorecards": scorecards, "charts": charts, "tables": tables}
+        if chart_warning:
+            result["warning"] = chart_warning
         logger.info(
             "_process_sync END  mode=%s  charts=%d  tables=%d  scorecards=%d  elapsed=%.2fs",
             mode, len(charts), len(tables), len(scorecards),

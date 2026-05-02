@@ -130,7 +130,6 @@ class LLMResponseSchema(BaseModel):
     @field_validator("charts", mode="before")
     @classmethod
     def drop_invalid_charts(cls, raw_charts):
-        # FIX BUG 1: was stub (pass) — restored full original body
         if not isinstance(raw_charts, list):
             raise ValueError("'charts' must be a list")
         valid = []
@@ -140,7 +139,10 @@ class LLMResponseSchema(BaseModel):
             except ValidationError as exc:
                 first_err = exc.errors()[0].get("msg", str(exc))
                 logger.warning("Dropping chart[%d] (%s): %s", i, raw.get("type", "?"), first_err)
-        if not valid:
+        # Allow empty charts list — scorecards_only / tables_only modes legitimately
+        # return no charts. The caller is responsible for ensuring charts are present
+        # when they are actually required.
+        if not valid and len(raw_charts) > 0:
             raise ValueError("All charts failed validation — no renderable charts returned")
         return valid
 
