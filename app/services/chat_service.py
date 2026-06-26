@@ -156,6 +156,46 @@ CRITICAL — pandas 2.0+ value_counts() rule:
 
 
 # ─────────────────────────────────────────────
+# EXCEL FUNCTION → PANDAS TRANSLATION RULES  [NEW]
+# Lets the chatbot understand Excel-style formula requests
+# (VLOOKUP/HLOOKUP/XLOOKUP, SUM, AVERAGE, COUNT, COUNTA, MIN, MAX,
+# MEDIAN, MODE) and translate them into correct pandas code.
+# ─────────────────────────────────────────────
+
+_EXCEL_FUNCTION_RULES = """\
+EXCEL-STYLE FUNCTION REQUESTS — translate these into pandas exactly as shown:
+
+Aggregation functions:
+  SUM(col)      -> df['col'].sum()
+  AVERAGE(col)  -> df['col'].mean()
+  COUNT(col)    -> df['col'].count()                 # counts numeric/non-null entries
+  COUNTA(col)   -> df['col'].notna().sum()            # counts all non-empty values
+  MIN(col)      -> df['col'].min()
+  MAX(col)      -> df['col'].max()
+  MEDIAN(col)   -> df['col'].median()
+  MODE(col)     -> df['col'].mode().iloc[0]            # most frequent value
+
+Lookup functions — VLOOKUP/HLOOKUP/XLOOKUP all mean "find a value in one column/row
+by matching a key", which in pandas is a merge or a map:
+  VLOOKUP(lookup_value, table, return_col)
+      -> result = df.loc[df['lookup_col'] == lookup_value, 'return_col']
+      -> for matching one dataframe against another (classic VLOOKUP):
+         result = left_df.merge(right_df[['key_col', 'return_col']], on='key_col', how='left')
+  HLOOKUP -> same as VLOOKUP but the lookup table is organized by row instead of column;
+      in pandas this is still a merge/map on the matching key — there is no row/column
+      distinction once the data is in a DataFrame.
+  XLOOKUP -> same as VLOOKUP, but use it whenever the user just wants "the value of X
+      that corresponds to Y" without specifying direction; a simple `.merge()` or
+      `df.set_index('key_col')['return_col'].reindex(values)` works.
+  If the user asks for "vlookup/hlookup/xlookup of the first N entries of <col>" without
+  specifying a separate lookup table, interpret it as: return the first N values of
+  <col> alongside their natural row key (e.g. an ID/index column if one exists), as a
+  flat DataFrame with reset_index — this mirrors how VLOOKUP would be used to pull
+  a column of values next to their keys.
+"""
+
+
+# ─────────────────────────────────────────────
 # SAFE EXEC  (unchanged)
 # ─────────────────────────────────────────────
 
@@ -408,6 +448,9 @@ _DATA_SIGNALS = {
     "sales", "profit", "orders", "customers", "products",
     "filter", "where", "group by", "pivot", "chart", "graph", "table",
     "increase", "decrease", "over time", "per", "across",
+    # Excel-style aggregation / lookup function requests against the dataset
+    "vlookup", "hlookup", "xlookup", "lookup",
+    "counta", "median", "mode",
 }
 
 
@@ -472,6 +515,11 @@ ON-TOPIC examples (allow these):
 - "which product has the highest profit margin?"
 - "how has customer count changed over the year?"
 - "is there a correlation between discount and sales?"
+- "give vlookup for customer name" / "do an xlookup for order id" / "hlookup the price"
+- "sum/average/count/counta/min/max/median/mode of a column"
+- Excel-style formula requests (VLOOKUP, HLOOKUP, XLOOKUP, SUM, AVERAGE, COUNT, COUNTA,
+  MIN, MAX, MEDIAN, MODE) applied to the uploaded dataset — the user wants the equivalent
+  computation run on their data, not an Excel tutorial.
 - Any question that can be answered by querying or analyzing the uploaded dataset,
   even if phrased casually or without using column names.
 
@@ -657,41 +705,78 @@ async def _llm_inspect_schema(df: pd.DataFrame, llm) -> dict:
     Ask the LLM to annotate the dataset schema:
     - Which columns are real business metrics (numeric, meaningful to aggregate)?
     - Which columns are dimensions (categorical grouping columns)?
-    - Which columns are junk (IDs, codes, phone numbers, etc.)?
     - Which column is the primary date/time column?
+    - Are there pairs of numeric columns whose PRODUCT gives a more meaningful
+      business metric than either column summed alone (e.g. unit_price × quantity,
+      rate × volume, hours × wage)?
 
     Falls back to dtype-based inspection on failure.
+
+    POST-PROCESSING (generic):
+    If the LLM returns a `multiplicative_pair`, this function creates a derived
+    column named "<col_a>_x_<col_b>" on df, inserts it at the front of metrics,
+    and removes the raw factor columns to prevent them from being mislabelled
+    in reports (e.g. sum(unit_price) ≠ total revenue).
     """
     sample_str = df.head(5).to_string()
     col_types = [(col, str(dt)) for col, dt in zip(df.columns, df.dtypes)]
     cardinalities = {col: int(df[col].nunique()) for col in df.columns}
 
-    prompt = f"""You are a data schema analyst. Inspect the dataset below and annotate its columns.
+    # Pass actual sums so the LLM can reason about whether a column is a
+    # per-row rate (small mean, large count) vs a pre-aggregated total.
+    num_cols_all = df.select_dtypes(include="number").columns.tolist()
+    col_stats: dict = {}
+    for c in num_cols_all:
+        try:
+            s = df[c].dropna()
+            col_stats[c] = {
+                "sum":  round(float(s.sum()), 4),
+                "mean": round(float(s.mean()), 4),
+                "max":  round(float(s.max()), 4),
+            }
+        except Exception:
+            pass
+
+    prompt = f"""You are a data schema analyst. Inspect this dataset and classify its columns.
 
 Column names and dtypes: {col_types}
 Cardinalities (unique value counts): {json.dumps(cardinalities)}
+Numeric column stats (sum / mean / max): {json.dumps(col_stats)}
 
 Sample rows:
 {sample_str}
 
-Your task:
-1. Identify real BUSINESS METRIC columns — numeric columns that represent measurable quantities
-   a business user would want to sum, average, or count (e.g. Revenue, Sales, Quantity, Profit, Rating).
+Your tasks:
+
+1. METRICS — numeric columns a business user would meaningfully sum or average:
+   e.g. Revenue, Profit, Quantity, Rating, Duration, Amount.
    Exclude: row IDs, zip codes, phone numbers, postal codes, any number used as an identifier.
 
-2. Identify DIMENSION columns — categorical columns meaningful for grouping or filtering
-   (e.g. Region, Category, Product, Segment, Status).
-   Exclude: free-text columns, high-cardinality columns with more than 50 unique values,
-   columns that are effectively IDs (e.g. Order ID, Customer ID).
+2. DIMENSIONS — categorical columns useful for grouping or filtering:
+   e.g. Region, Category, Product, Status. Exclude IDs and columns with > 50 unique values.
 
-3. Identify the PRIMARY DATE column (if any) — the column most suitable for time-series analysis.
-   Prefer columns whose dtype is datetime or whose values parse as dates.
+3. DATE_COL — the single best column for time-series analysis (datetime dtype preferred).
+
+4. MULTIPLICATIVE_PAIR — two numeric columns whose product gives a more meaningful
+   business metric than either column summed individually.
+   Common examples:
+     - unit_price × quantity  →  line revenue
+     - hourly_rate × hours    →  total labour cost
+     - price_per_unit × units_sold  →  total sales
+   ONLY report a pair when BOTH of these are true:
+     a. One column is clearly a per-item rate (its mean ≈ a typical single-item value,
+        and its name suggests price / rate / cost_per / fee_per).
+     b. The other column is clearly a count/quantity for the same rows.
+   If no such pair exists, return null for both fields.
+   IMPORTANT: Do NOT report a pair just because two numeric columns exist — only when
+   their product has an obvious, named business meaning.
 
 Return ONLY valid JSON (no markdown, no explanation):
 {{
   "metrics": ["col1", "col2"],
   "dimensions": ["col3", "col4"],
-  "date_col": "col5_or_null"
+  "date_col": "col5_or_null",
+  "multiplicative_pair": {{"factor_a": "col_or_null", "factor_b": "col_or_null"}}
 }}
 """
     try:
@@ -701,15 +786,52 @@ Return ONLY valid JSON (no markdown, no explanation):
         ])
         clean = re.sub(r"```(?:json)?|```", "", raw).strip()
         schema = json.loads(clean)
-        # Validate that returned columns actually exist in df
+
         valid_cols = set(df.columns)
-        metrics = [c for c in schema.get("metrics", []) if c in valid_cols]
+        metrics    = [c for c in schema.get("metrics", [])    if c in valid_cols]
         dimensions = [c for c in schema.get("dimensions", []) if c in valid_cols]
-        date_col = schema.get("date_col")
+        date_col   = schema.get("date_col")
         if date_col and date_col not in valid_cols:
             date_col = None
-        logger.info("LLM schema: %d metrics, %d dims, date_col=%s", len(metrics), len(dimensions), date_col)
-        return {"metrics": metrics, "dimensions": dimensions, "date_col": date_col}
+
+        # ── Generic multiplicative-pair handling ──────────────────────────────
+        # The LLM tells us which two columns to multiply; we don't assume names.
+        pair      = schema.get("multiplicative_pair") or {}
+        factor_a  = pair.get("factor_a")
+        factor_b  = pair.get("factor_b")
+        derived_col = None
+
+        if (
+            factor_a and factor_b
+            and factor_a != factor_b
+            and factor_a in valid_cols and factor_b in valid_cols
+            and pd.api.types.is_numeric_dtype(df[factor_a])
+            and pd.api.types.is_numeric_dtype(df[factor_b])
+        ):
+            # Name the derived column after its factors, not hardcoded "LineRevenue"
+            derived_col = f"{factor_a}_x_{factor_b}"
+            df[derived_col] = df[factor_a] * df[factor_b]
+            logger.info(
+                "Schema: derived column '%s' = %s × %s  (sum=%.2f)",
+                derived_col, factor_a, factor_b, float(df[derived_col].sum()),
+            )
+            # Remove both raw factor columns from metrics; they're now redundant
+            # and would produce misleading totals if summed individually.
+            metrics = [c for c in metrics if c not in {factor_a, factor_b}]
+            if derived_col not in metrics:
+                metrics.insert(0, derived_col)
+
+        logger.info(
+            "LLM schema: %d metrics, %d dims, date_col=%s, derived=%s",
+            len(metrics), len(dimensions), date_col, derived_col,
+        )
+        return {
+            "metrics":     metrics,
+            "dimensions":  dimensions,
+            "date_col":    date_col,
+            "derived_col": derived_col,   # None when no multiplicative pair detected
+        }
+
     except Exception as e:
         logger.warning("LLM schema inspection failed (%s) — using dtype fallback", e)
         return _dtype_inspect_schema(df)
@@ -1002,6 +1124,12 @@ def build_summary_context(df: pd.DataFrame, schema: dict) -> dict:
     Build a comprehensive analytics context for summary/insight queries.
     Runs all available blocks across metrics and dimensions.
     Returns a rich dict that the LLM uses to produce a structured report.
+
+    FIX: Now includes a 'verified_totals' block — pandas-computed ground-truth
+    aggregates for every metric.  These are passed to _llm_generate_summary as
+    authoritative numbers the LLM must use verbatim for all headline figures.
+    This prevents the LLM from re-deriving or misreporting totals (e.g. summing
+    a unit-price column and labelling it "Total Revenue").
     """
     metrics    = schema["metrics"]
     dimensions = schema["dimensions"]
@@ -1010,8 +1138,39 @@ def build_summary_context(df: pd.DataFrame, schema: dict) -> dict:
     if not metrics:
         return {}
 
+    # ── Verified totals (ground truth) ───────────────────────────────────────
+    # Compute and format authoritative aggregates BEFORE the per-metric loop
+    # so they can be flagged as the single source of truth in the LLM prompt.
+    def _fmt(v: float) -> str:
+        if not isinstance(v, (int, float)) or (isinstance(v, float) and not __import__("math").isfinite(v)):
+            return "N/A"
+        abs_v = abs(v)
+        if abs_v >= 1_000_000_000:
+            return f"${v / 1_000_000_000:.2f}B"
+        if abs_v >= 1_000_000:
+            return f"${v / 1_000_000:.2f}M"
+        if abs_v >= 1_000:
+            return f"${v / 1_000:.1f}K"
+        return f"{v:.4g}"
+
+    verified_totals: dict = {}
+    for metric in metrics:
+        if metric not in df.columns:
+            continue
+        try:
+            col = df[metric].dropna()
+            verified_totals[metric] = {
+                "sum":    _fmt(float(col.sum())),
+                "mean":   _fmt(float(col.mean())),
+                "count":  int(col.count()),
+                "raw_sum": float(col.sum()),
+            }
+        except Exception:
+            pass
+
     summary = {
         "shape": {"rows": int(len(df)), "cols": int(len(df.columns))},
+        "verified_totals": verified_totals,   # ← authoritative ground-truth block
         "metrics": {},
         "dimensions": {},
         "trends": {},
@@ -1136,11 +1295,26 @@ async def _llm_generate_summary(
     dimensions = schema["dimensions"]
     date_col   = schema.get("date_col")
 
+    # ── Build verified-totals instruction ────────────────────────────────────
+    # These are pandas-computed ground-truth values.  The LLM MUST use them for
+    # all headline figures — it must NOT re-derive, recalculate, or substitute
+    # different numbers.
+    verified_totals = summary_context.get("verified_totals", {})
+    verified_block = ""
+    if verified_totals:
+        lines = ["🚨 AUTHORITATIVE NUMBERS — use these EXACT values for all headline figures.",
+                 "DO NOT recalculate, substitute, or ignore these:"]
+        for col, agg in verified_totals.items():
+            lines.append(f"  {col}: total={agg['sum']}, mean={agg['mean']}, count={agg['count']:,}")
+        verified_block = "\n".join(lines)
+
     prompt = f"""You are a friendly data analyst explaining findings to a non-technical person.
 The user asked: "{query}"
 
 You have been given a comprehensive analytics context computed from their dataset.
 Generate a clear, story-driven report as a JSON object.
+
+{verified_block}
 
 Analytics context:
 {json.dumps(summary_context, indent=2, default=str)}
@@ -1286,6 +1460,8 @@ Stats:
 {stats}
 
 {_PANDAS_COMPAT_RULES}
+
+{_EXCEL_FUNCTION_RULES}
 
 Write pandas code to answer the current query.
 Use the conversation history only to resolve references like "it", "that column", "the same period".

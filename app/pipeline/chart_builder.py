@@ -37,59 +37,49 @@ logger = logging.getLogger(__name__)
 #
 def _compute_histogram_stats(series: pd.Series) -> dict:
     """
-    Compute all statistical context needed for a well-formed histogram.
- 
-    Returns a dict with:
-      x_range   — [lo, hi] axis zoom range (IQR fence), or None if no outliers
-      bin_size  — Freedman-Diaconis bin width (falls back to Sturges)
-      stats     — mean, median, std, skewness, outlier info, quartiles
+    Compute the minimum stats needed to render a well-formed histogram.
+
+    Returns:
+      x_range  — [lo, hi] axis zoom (IQR fence) or None if no outliers
+      bin_size — Freedman-Diaconis bin width or None (Sturges fallback)
+      mean     — float, for insight text reuse
+      median   — float, for insight text reuse
+
+    Deliberately omits std, skewness, q1/q3/iqr — those were only used
+    for display annotations that aren't worth 3 extra numpy passes on
+    large datasets.
     """
     vals = series.dropna().astype(float)
     n    = len(vals)
- 
+
     if n == 0:
-        return {"x_range": None, "bin_size": None, "stats": {}}
- 
+        return {"x_range": None, "bin_size": None, "mean": None, "median": None}
+
     arr = vals.to_numpy()
- 
-    # ── Quartiles & IQR ──────────────────────────────────────────────────────
-    q1  = float(np.percentile(arr, 25))
-    q3  = float(np.percentile(arr, 75))
-    iqr = q3 - q1
- 
-    # ── Outlier detection (3×IQR fence — wider than Tukey's 1.5× to be lenient) ─
-    # Using 3× keeps the fence wide enough to not over-clip genuine heavy-tail
-    # distributions like sales revenue, while still excluding true extremes.
+
+    # ── Quartiles & IQR (one percentile call for both) ───────────────────────
+    q1, q3 = float(np.percentile(arr, 25)), float(np.percentile(arr, 75))
+    iqr    = q3 - q1
+
+    # ── Outlier fencing → axis zoom ──────────────────────────────────────────
     if iqr > 0:
-        lo_fence = q1 - 3.0 * iqr
-        hi_fence = q3 + 3.0 * iqr
-        outlier_mask  = (arr < lo_fence) | (arr > hi_fence)
-        outlier_count = int(outlier_mask.sum())
-        outlier_pct   = round(outlier_count / n * 100, 1)
- 
-        # Only apply axis zoom if outliers actually exist and distort the range
-        if outlier_count > 0:
-            # Pad the fence by 5% of the core range for visual breathing room
+        lo_fence     = q1 - 3.0 * iqr
+        hi_fence     = q3 + 3.0 * iqr
+        outlier_mask = (arr < lo_fence) | (arr > hi_fence)
+        if outlier_mask.any():
             core_range = hi_fence - lo_fence
-            pad = core_range * 0.05
-            x_range = [round(lo_fence - pad, 2), round(hi_fence + pad, 2)]
+            pad        = core_range * 0.05
+            x_range    = [round(lo_fence - pad, 2), round(hi_fence + pad, 2)]
         else:
             x_range = None
     else:
-        # IQR = 0: all values are identical (or nearly so) — no outlier concept
         lo_fence = float(arr.min())
         hi_fence = float(arr.max())
-        outlier_count = 0
-        outlier_pct   = 0.0
-        x_range = None
- 
+        x_range  = None
+
     # ── Freedman-Diaconis bin width ───────────────────────────────────────────
-    # bin_width = 2 × IQR × n^(-1/3)
-    # This adapts to both data spread and sample size. It's the standard
-    # data-driven bin width used by numpy, matplotlib, and seaborn by default.
     if iqr > 0 and n > 1:
-        fd_width = 2.0 * iqr * (n ** (-1.0 / 3.0))
-        # Clamp: never fewer than 5 bins or more than 150 bins in the core range
+        fd_width  = 2.0 * iqr * (n ** (-1.0 / 3.0))
         core_span = hi_fence - lo_fence
         if fd_width > 0:
             n_bins = core_span / fd_width
@@ -99,36 +89,19 @@ def _compute_histogram_stats(series: pd.Series) -> dict:
                 fd_width = core_span / 150.0
         bin_size = round(fd_width, 4) if fd_width > 0 else None
     else:
-        # Sturges' rule fallback for zero-IQR or tiny datasets
         n_bins_sturges = max(5, int(math.ceil(1 + math.log2(n))) if n > 1 else 5)
-        data_range = float(arr.max() - arr.min())
-        bin_size = round(data_range / n_bins_sturges, 4) if data_range > 0 else None
- 
-    # ── Summary stats ─────────────────────────────────────────────────────────
+        data_range     = float(arr.max() - arr.min())
+        bin_size       = round(data_range / n_bins_sturges, 4) if data_range > 0 else None
+
+    # mean and median are cheap and reused by _generate_insight
     mean   = float(np.mean(arr))
     median = float(np.median(arr))
-    std    = float(np.std(arr, ddof=1)) if n > 1 else 0.0
- 
-    # Pearson's moment skewness
-    if std > 0:
-        skewness = float(np.mean(((arr - mean) / std) ** 3))
-    else:
-        skewness = 0.0
- 
+
     return {
         "x_range": x_range,
         "bin_size": bin_size,
-        "stats": {
-            "mean":          round(mean, 4),
-            "median":        round(median, 4),
-            "std":           round(std, 4),
-            "skewness":      round(skewness, 4),
-            "outlier_count": outlier_count,
-            "outlier_pct":   outlier_pct,
-            "q1":            round(q1, 4),
-            "q3":            round(q3, 4),
-            "iqr":           round(iqr, 4),
-        },
+        "mean":     round(mean, 4),
+        "median":   round(median, 4),
     }
 
 def _iqr_y_range(values_flat: list, fence_multiplier: float = 3.0) -> list | None:
@@ -190,15 +163,217 @@ def _box_stats(values_flat: list) -> dict:
 # 5. CHART BUILDER
 # ─────────────────────────────────────────────
 
+def _fmt_compact(v: float) -> str:
+    """Format a number compactly for inline insight text."""
+    if not math.isfinite(v):
+        return "N/A"
+    abs_v = abs(v)
+    if abs_v >= 1_000_000_000:
+        return f"{v / 1_000_000_000:.2f}B"
+    if abs_v >= 1_000_000:
+        return f"{v / 1_000_000:.2f}M"
+    if abs_v >= 1_000:
+        return f"{v / 1_000:.1f}K"
+    if v == int(v):
+        return str(int(v))
+    return f"{v:.4g}"
+
+
 class ChartBuilder:
     def __init__(self, transformer: DataTransformer):
         self._transformer = transformer
 
+    @staticmethod
+    def _generate_insight(chart_type: str, cfg: dict, df: pd.DataFrame,
+                          transformed_df: pd.DataFrame | None = None,
+                          hist_mean: float | None = None,
+                          hist_median: float | None = None) -> str | None:
+        """
+        Produce a one-sentence analytical insight for the rendered chart.
+        Returns None when no meaningful insight can be computed.
+        All exceptions are swallowed — insight generation must never break a chart.
+
+        transformed_df: the already-aggregated DataFrame returned by the transformer.
+        hist_mean / hist_median: pre-computed values from _compute_histogram_stats,
+          passed through so the histogram insight never re-scans the column.
+        """
+        try:
+            x = cfg.get("x")
+            y = cfg.get("y")
+
+            # ── bar / grouped_bar / treemap / waterfall / funnel ─────────────
+            if chart_type in ("bar", "grouped_bar", "treemap", "waterfall", "funnel"):
+                if y and x:
+                    # Prefer the already-aggregated transformed df
+                    src = transformed_df if (
+                        transformed_df is not None
+                        and x in transformed_df.columns
+                        and y in transformed_df.columns
+                    ) else df
+                    if x not in src.columns or y not in src.columns:
+                        return None
+                    grp = src.groupby(x, observed=True)[y].sum().dropna()
+                    if grp.empty:
+                        return None
+                    top_label = str(grp.idxmax())
+                    top_val   = float(grp.max())
+                    total     = float(grp.sum())
+                    pct       = (top_val / total * 100) if total else 0
+                    return (
+                        f'"{top_label}" leads with {_fmt_compact(top_val)} — '
+                        f"{pct:.1f}% of the total."
+                    )
+
+            # ── line / area ───────────────────────────────────────────────────
+            if chart_type in ("line", "area"):
+                src = transformed_df if (
+                    transformed_df is not None and y and y in transformed_df.columns
+                ) else df
+                if y and y in src.columns:
+                    series = src[y].dropna()
+                    if len(series) < 2:
+                        return None
+                    first = float(series.iloc[0])
+                    last  = float(series.iloc[-1])
+                    if first and first != 0:
+                        change_pct = (last - first) / abs(first) * 100
+                        direction  = "upward" if change_pct > 0 else "downward"
+                        return (
+                            f"Overall trend is {direction} "
+                            f"({change_pct:+.1f}% from start to end)."
+                        )
+
+            # ── stacked_bar ───────────────────────────────────────────────────
+            if chart_type == "stacked_bar":
+                src = transformed_df if (
+                    transformed_df is not None and y and y in transformed_df.columns
+                ) else df
+                if y and y in src.columns:
+                    total = float(src[y].dropna().sum())
+                    return f"Total across all categories: {_fmt_compact(total)}."
+
+            # ── pie ───────────────────────────────────────────────────────────
+            if chart_type == "pie":
+                if y and x:
+                    src = transformed_df if (
+                        transformed_df is not None
+                        and x in transformed_df.columns
+                        and y in transformed_df.columns
+                    ) else df
+                    if x not in src.columns or y not in src.columns:
+                        return None
+                    grp = src.groupby(x, observed=True)[y].sum().dropna()
+                    if grp.empty:
+                        return None
+                    top_label = str(grp.idxmax())
+                    top_val   = float(grp.max())
+                    total     = float(grp.sum())
+                    pct       = (top_val / total * 100) if total else 0
+                    return f'"{top_label}" dominates at {pct:.1f}% of the total.'
+
+            # ── histogram ─────────────────────────────────────────────────────
+            if chart_type == "histogram":
+                # Use pre-computed values from _compute_histogram_stats when
+                # available — no extra scan of the column.
+                mean_v   = hist_mean
+                median_v = hist_median
+                if mean_v is None or median_v is None:
+                    if x and x in df.columns:
+                        s        = df[x].dropna().astype(float)
+                        mean_v   = float(s.mean())
+                        median_v = float(s.median())
+                    else:
+                        return None
+                # Skew direction: Pearson's second coefficient sign (mean-median)/std
+                # is expensive to compute precisely but the sign alone is free.
+                if mean_v > median_v * 1.05:
+                    skew_dir = "right (positive)"
+                elif mean_v < median_v * 0.95:
+                    skew_dir = "left (negative)"
+                else:
+                    skew_dir = "approximately normal"
+                return (
+                    f"Mean {_fmt_compact(mean_v)}, median {_fmt_compact(median_v)}. "
+                    f"Distribution is {skew_dir}-skewed."
+                )
+
+            # ── box ───────────────────────────────────────────────────────────
+            if chart_type == "box":
+                if y and y in df.columns:
+                    series   = df[y].dropna().astype(float)
+                    median_v = float(series.median())
+                    q1       = float(series.quantile(0.25))
+                    q3       = float(series.quantile(0.75))
+                    return (
+                        f"Median {_fmt_compact(median_v)}, "
+                        f"IQR {_fmt_compact(q1)} – {_fmt_compact(q3)}."
+                    )
+
+            # ── scatter / bubble ──────────────────────────────────────────────
+            if chart_type in ("scatter", "bubble"):
+                if x and y and x in df.columns and y in df.columns:
+                    corr = float(df[[x, y]].dropna().corr().iloc[0, 1])
+                    if abs(corr) >= 0.7:
+                        strength = "strong"
+                    elif abs(corr) >= 0.4:
+                        strength = "moderate"
+                    else:
+                        strength = "weak"
+                    direction = "positive" if corr >= 0 else "negative"
+                    return (
+                        f"{strength.capitalize()} {direction} correlation "
+                        f"(r ≈ {corr:.2f})."
+                    )
+
+            # ── heatmap ───────────────────────────────────────────────────────
+            if chart_type == "heatmap":
+                z_col = cfg.get("z")
+                src = transformed_df if (
+                    transformed_df is not None
+                    and z_col and z_col in transformed_df.columns
+                    and x and x in transformed_df.columns
+                    and y and y in transformed_df.columns
+                ) else df
+                if z_col and z_col in src.columns and x and y and x in src.columns and y in src.columns:
+                    grp = src.groupby([x, y], observed=True)[z_col].mean()
+                    if not grp.empty:
+                        max_idx = grp.idxmax()
+                        max_val = float(grp.max())
+                        return (
+                            f"Highest concentration: {x}={max_idx[0]}, "
+                            f"{y}={max_idx[1]} ({_fmt_compact(max_val)})."
+                        )
+
+        except Exception:
+            pass
+
+        return None
+
     def build(self, cfg: dict) -> dict | None:
+        self._last_transformed_df = None   # reset before each build
+        result = self._build_inner(cfg)
+        if result is not None:
+            insight = self._generate_insight(
+                result.get("type", ""), cfg,
+                self._transformer._source,
+                transformed_df=self._last_transformed_df,
+                hist_mean=result.pop("_hist_mean", None),
+                hist_median=result.pop("_hist_median", None),
+            )
+            if insight:
+                result["insight"] = insight
+        return result
+
+    def _build_inner(self, cfg: dict) -> dict | None:
         try:
             df = self._transformer.transform(cfg)
             if df.empty:
                 return None
+
+            # Stash the transformed df so build() can pass it to _generate_insight.
+            # This lets insight generation use already-aggregated data rather than
+            # re-running groupby on the full source DataFrame.
+            self._last_transformed_df = df
 
             chart_type = cfg["type"]
             x          = cfg["x"]
@@ -249,23 +424,22 @@ class ChartBuilder:
                 }
 
              # ── histogram ────────────────────────────────────────────────────
-            # FIXED: compute all stats on the backend so the frontend can render
-            # a properly scaled, binned, and annotated histogram without any
-            # client-side number-crunching.
             if chart_type == "histogram":
                 raw_values = df[x].dropna()
                 hist_stats = _compute_histogram_stats(raw_values)
- 
+
                 return {
                     "type":        "histogram",
                     "title":       cfg["title"],
-                    "values":      raw_values.tolist(),   # all values (outliers included)
+                    "values":      raw_values.tolist(),
                     "x_label":     x,
                     "layout_size": cfg["layout_size"],
-                    # ── new fields ──────────────────
-                    "x_range":     hist_stats["x_range"],   # [lo, hi] or None
-                    "bin_size":    hist_stats["bin_size"],   # FD bin width or None
-                    "stats":       hist_stats["stats"],      # mean, median, std, skew, ...
+                    "x_range":     hist_stats["x_range"],
+                    "bin_size":    hist_stats["bin_size"],
+                    # mean/median stashed for _generate_insight reuse —
+                    # stripped from the final payload in build() after insight is generated
+                    "_hist_mean":   hist_stats["mean"],
+                    "_hist_median": hist_stats["median"],
                 }
 
             # ── heatmap ──────────────────────────────────────────────────────
@@ -288,8 +462,6 @@ class ChartBuilder:
                 if safe_df.empty:
                     logger.error("Heatmap failed: z column invalid after conversion")
                     return None
-
-                logger.info("Heatmap dtype AFTER FIX: %s", safe_df[z_col].dtype)
 
                 # Step 3: Limit dimensions to keep the grid readable.
                 # Cap at 20 rows × 20 columns — beyond this the cells become too

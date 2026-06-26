@@ -3,6 +3,7 @@
 import asyncio
 import concurrent.futures
 import logging
+import math
 import os
 import re
 import time
@@ -12,17 +13,14 @@ from app.utils.column_utils import _meaningful_numeric_cols
 
 import pandas as pd
 
-# _meaningful_numeric_cols logs at INFO on every call. It is called once per
-# chart config processed (inside ChartConfigNormalizer.normalize, which runs
-# in the thread pool) — producing 10–15 identical lines per query. The function
-# itself cannot be changed here, so we cap its logger at WARNING so only genuine
-# warnings surface. This is intentional and documented.
-logging.getLogger("app.utils.column_utils").setLevel(logging.WARNING)
-
 logger = logging.getLogger(__name__)
 
 EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=(os.cpu_count() or 4) * 2,
+    # CPU-bound pandas work is GIL-constrained — more threads cause context-switch
+    # overhead with no parallelism gain.  Keep a small pool: enough to run
+    # _process_sync and _apply_date_filter concurrently with async I/O, but
+    # no larger.  2–4 workers is optimal for this workload.
+    max_workers=min(4, os.cpu_count() or 2),
     thread_name_prefix="chart-worker",
 )
 
@@ -33,8 +31,34 @@ from app.pipeline.chart_builder import ChartBuilder
 from app.pipeline.table_builder import TableBuilder
 from app.pipeline.scorecard import ScorecardBuilder
 from app.schemas.chart_schema import LLMResponseSchema
-from app.utils.cache import _cache_key, _result_cache
+from app.utils.cache import _cache_key, _cache_key_from_fingerprint, _result_cache
 from app.utils.task_manager import is_cancelled
+from app.utils.data_store import dataset_metadata_cache, data_store
+from app.pipeline.llm_client import _infer_aggregation
+from app.utils.df_stats import DataFrameStats
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QUERY PLAN  — computed once per request, passed through the entire pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+
+from dataclasses import dataclass, field
+
+@dataclass
+class QueryPlan:
+    """
+    All query-parsing results computed exactly once from corrected_query.
+    Eliminates repeated calls to _query_mode, _detect_requested_chart_types,
+    _extract_quantity, _should_show_tables, _should_show_scorecards which
+    each re-run regex over the same string.
+    """
+    mode:            str
+    requested_types: list
+    quantity:        int
+    show_tables:     bool
+    show_scorecards: bool
+    table_quantity:  int  = 1
+    sc_quantity:     int  = 6
 
 
 def _set_loop_executor(loop: asyncio.AbstractEventLoop | None = None) -> None:
@@ -48,13 +72,13 @@ _NUMBER_WORDS = {
 
 # Maximum charts returned per query mode.
 # Tune these constants to control dashboard density without touching logic.
-CHART_MAX_EXPLORATORY = 12   # open-ended: "dashboard", "analyze", "overview"
-CHART_MAX_ALL_OF_TYPE = 10   # wildcard:   "all possible bar charts"
-CHART_MAX_MULTI       = 8    # named set:  "histogram and pie and scatter"
+CHART_MAX_EXPLORATORY = 8   # open-ended: "dashboard", "analyze", "overview"
+CHART_MAX_ALL_OF_TYPE = 8   # wildcard:   "all possible bar charts"
+CHART_MAX_MULTI       = 6    # named set:  "histogram and pie and scatter"
 # "specific" mode always returns exactly 1 — no cap needed
 
-TABLE_MAX     = 5   # max tables in any single response
-SCORECARD_MAX = 8   # max scorecards in any single response (mirrors scorecard.py _SCORECARD_MAX)
+TABLE_MAX     = 2   # max tables in any single response
+SCORECARD_MAX = 6   # max scorecards in any single response (mirrors scorecard.py _SCORECARD_MAX)
 
 def _over_limit_msg(kind: str, requested: int, limit: int) -> str:
     """Human-readable message shown when user requests more than the allowed limit."""
@@ -233,21 +257,219 @@ def _apply_date_filter(df: pd.DataFrame, query: str) -> pd.DataFrame:
         return df
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATASET CONTEXT BUILDER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fmt_context_val(v: float) -> str:
+    """Compact formatter for dataset context — keeps the profile readable."""
+    try:
+        if not math.isfinite(v):
+            return "N/A"
+        abs_v = abs(v)
+        if abs_v >= 1_000_000_000:
+            return f"{v / 1_000_000_000:.2f}B"
+        if abs_v >= 1_000_000:
+            return f"{v / 1_000_000:.2f}M"
+        if abs_v >= 1_000:
+            return f"{v / 1_000:.1f}K"
+        return f"{v:.4g}"
+    except Exception:
+        return str(v)
+
+
+def _apply_aggregation_inference(llm_schema, col_dt_list: list) -> None:
+    """
+    Post-process LLM chart configs: fill in aggregation for any chart whose
+    y/z column has aggregation="none" but a deterministic correct aggregation
+    can be inferred from _infer_aggregation.
+
+    ONLY fills in "none" — never overrides a concrete aggregation the LLM
+    already provided (sum/mean/count/min/max).  This prevents the inference
+    from wrongly changing correct LLM choices.
+
+    Skips chart types that legitimately use "none" (scatter, histogram, box).
+    Mutates llm_schema.charts in place.
+    """
+    dtype_map = {col: str(dt) for col, dt in col_dt_list}
+    _NO_AGG_TYPES = {"scatter", "histogram", "box"}
+
+    for chart in llm_schema.charts:
+        if chart.type in _NO_AGG_TYPES:
+            continue
+        # Only fill in when the LLM left aggregation as "none"
+        if chart.aggregation != "none":
+            continue
+        target_col = chart.y
+        if chart.type == "heatmap":
+            target_col = getattr(chart, "z", None)
+        if not target_col or target_col not in dtype_map:
+            continue
+        inferred = _infer_aggregation(target_col, dtype_map[target_col])
+        if inferred != "none":
+            logger.debug(
+                "Aggregation fill-in: chart=%s col=%r none→%r",
+                chart.type, target_col, inferred,
+            )
+            chart.aggregation = inferred
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ChartGenerator
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ChartGenerator:
-    def __init__(self, data: pd.DataFrame):
+    def __init__(self, data: pd.DataFrame, dataset_id: str | None = None):
         self.data               = data
-        self._col_dt_list       = list(zip(data.columns, data.dtypes))
+        self._dataset_id        = dataset_id
         self._llm               = LLMClient()
-        self._normalizer        = ChartConfigNormalizer(data)
+        # Detect any multiplicative column pair (e.g. price × quantity) and
+        # pre-compute a derived column on self.data before building stats/normalizer.
+        # This must run BEFORE DataFrameStats/ChartConfigNormalizer so they include
+        # the derived column in their num_cols list from the start.
+        self._derived_col: str | None = self._inject_derived_col()
+        self._col_dt_list       = list(zip(data.columns, data.dtypes))
+        # Compute DataFrame statistics once — shared by normalizer, scorecard
+        # builder, and chart builder so no module scans the DataFrame independently.
+        self._stats             = DataFrameStats(data)
+        self._normalizer        = ChartConfigNormalizer(data, stats=self._stats)
         self._transformer       = DataTransformer(data)
         self._builder           = ChartBuilder(self._transformer)
         self._table_builder     = TableBuilder(data)
-        self._scorecard_builder = ScorecardBuilder(data)
+        self._scorecard_builder = ScorecardBuilder(data, stats=self._stats)
         logger.info("ChartGenerator initialised (%d rows, %d cols)", *data.shape)
+
+    # ── Derived column detection ──────────────────────────────────────────────
+
+    # Substrings that signal a column is a per-row rate (unit price, hourly rate,
+    # cost-per-unit, fee-per-item, …).  Matched against the fully-lowercased,
+    # space/underscore-stripped column name.
+    _RATE_HINTS = frozenset({
+        "price", "rate", "unitcost", "unit_cost",
+        "unitprice", "unit_price", "saleprice", "sale_price",
+        "sellingprice", "selling_price", "costperunit", "cost_per_unit",
+        "feeper", "chargeper", "wageper", "salaryper",
+        "perperson", "perunit", "peritem", "perorder",
+        "wage", "salary", "fee", "tariff",
+    })
+
+    # Substrings that signal a column is a count / quantity.
+    _QTY_HINTS = frozenset({
+        "quantity", "qty", "units", "count", "volume",
+        "sold", "ordered", "shipped", "produced", "purchased",
+        "hours", "hrs", "days", "weeks", "months",
+        "numberof", "numof", "total_items", "items",
+    })
+
+    def _inject_derived_col(self) -> str | None:
+        """
+        Detect a (rate_col × qty_col) pair in self.data using column-name
+        heuristics that work for ANY dataset — no hardcoded column names.
+
+        Rules (all must pass):
+          1. Exactly one column matches _RATE_HINTS and is numeric.
+          2. Exactly one column matches _QTY_HINTS and is numeric.
+          3. The two columns are different.
+          4. The derived product has a sum meaningfully larger than the raw
+             rate column's sum (guards against false positives where a rate
+             column coincidentally has a qty-like sibling).
+
+        If a pair is found, adds a "<rate>_x_<qty>" column to self.data and
+        returns its name.  Otherwise returns None.
+        """
+        df = self.data
+        num_cols = df.select_dtypes(include="number").columns.tolist()
+
+        rate_candidates = [
+            c for c in num_cols
+            if any(h in c.lower().replace(" ", "").replace("_", "") for h in self._RATE_HINTS)
+        ]
+        qty_candidates = [
+            c for c in num_cols
+            if any(h in c.lower().replace(" ", "").replace("_", "") for h in self._QTY_HINTS)
+        ]
+
+        # Only act when there is exactly one unambiguous candidate on each side
+        if len(rate_candidates) != 1 or len(qty_candidates) != 1:
+            return None
+        rate_col = rate_candidates[0]
+        qty_col  = qty_candidates[0]
+        if rate_col == qty_col:
+            return None
+
+        try:
+            derived_sum = float((df[rate_col] * df[qty_col]).sum())
+            rate_sum    = float(df[rate_col].sum())
+            # Sanity check: derived total must be larger than the raw rate sum
+            # (if they're equal or derived is smaller, the pair is likely wrong)
+            if derived_sum <= rate_sum:
+                return None
+
+            derived_col = f"{rate_col}_x_{qty_col}"
+            df[derived_col] = df[rate_col] * df[qty_col]
+            logger.info(
+                "ChartGenerator: derived column '%s' = %s × %s  (sum=%.2f vs rate_sum=%.2f)",
+                derived_col, rate_col, qty_col, derived_sum, rate_sum,
+            )
+            return derived_col
+        except Exception as exc:
+            logger.warning("ChartGenerator: derived column detection failed: %s", exc)
+            return None
+
+    def _make_query_plan(self, query: str) -> QueryPlan:
+        """
+        Parse corrected_query once and return a QueryPlan.
+        All downstream methods consume the plan — no method re-parses the query.
+        """
+        mode            = self._query_mode(query)
+        requested_types = self._detect_requested_chart_types(query)
+        quantity        = self._extract_quantity(query)
+        show_tables     = self._should_show_tables(query)
+        show_scorecards = self._should_show_scorecards(query)
+        tbl_qty = self._extract_non_chart_quantity(query, "table")
+        if tbl_qty == 1:
+            tbl_qty = self._extract_non_chart_quantity(query, "tables")
+        sc_qty  = self._extract_non_chart_quantity(query, "scorecard")
+        if sc_qty == 1:
+            sc_qty  = self._extract_non_chart_quantity(query, "scorecards")
+        return QueryPlan(
+            mode=mode,
+            requested_types=requested_types,
+            quantity=quantity,
+            show_tables=show_tables,
+            show_scorecards=show_scorecards,
+            table_quantity=min(tbl_qty, TABLE_MAX),
+            sc_quantity=min(sc_qty if sc_qty > 1 else SCORECARD_MAX, SCORECARD_MAX),
+        )
+
+    def _get_dataset_metadata(self) -> dict:
+        """
+        Return the metadata dict for self.data, computing it at most once.
+
+        Two-level cache:
+          1. Instance-level (_metadata_cache): computed at most once per
+             ChartGenerator lifetime regardless of dataset_id.  Eliminates
+             the double-compute seen when _augment_query() and generate()
+             both call this method in the same request.
+          2. Process-level (dataset_metadata_cache): keyed by dataset_id,
+             survives across requests for the same dataset.  Only active
+             when dataset_id was provided at construction time.
+        """
+        if hasattr(self, "_metadata_cache"):
+            return self._metadata_cache  # type: ignore[return-value]
+
+        if self._dataset_id is not None:
+            meta = dataset_metadata_cache.get_or_compute(
+                self._dataset_id, self.data
+            )
+        else:
+            # Fallback: compute without the process-level cache (no dataset_id)
+            from app.utils.data_store import _compute_dataset_metadata
+            meta = _compute_dataset_metadata(self.data)
+
+        self._metadata_cache = meta  # cache on instance — survives this request
+        return meta
 
     _BROAD_INTENT = {
         "dashboard", "analyze", "analyse", "analysis", "analyses",
@@ -361,6 +583,26 @@ class ChartGenerator:
                 seen[chart_type] = pos
         return [t for t, _ in sorted(seen.items(), key=lambda x: x[1])]
 
+    @staticmethod
+    def _count_chart_dimensions(query: str, col_dt_list: list) -> int:
+        """
+        Count how many distinct dataset columns are referenced in the query
+        joined by 'and' / 'or' / commas alongside a chart type request.
+        Returns the count so callers can decide whether to treat the query
+        as multi-dimension (more than one chart needed) vs single-chart.
+
+        Only considers actual column names (case-insensitive) so generic
+        words like 'and' in natural language don't falsely inflate the count.
+        """
+        if not col_dt_list:
+            return 0
+        q_lower = query.lower()
+        matched = sum(
+            1 for col, _ in col_dt_list
+            if col.lower() in q_lower
+        )
+        return matched
+
     def _query_mode(self, query: str) -> str:
         types    = self._detect_requested_chart_types(query)
         quantity = self._extract_quantity(query)
@@ -371,7 +613,26 @@ class ChartGenerator:
             if self._query_matches(query, self._SCORECARD_EXPLICIT):  return "scorecards_only"
             return "exploratory"
         if quantity == -1:                    return "all_of_type"
-        if len(types) == 1 and quantity == 1: return "specific"
+        if len(types) == 1 and quantity == 1:
+            # Treat as "multi" when the user names multiple columns joined by
+            # "and"/"or"/comma alongside a single chart type — e.g.
+            # "pie chart for countries and continent".
+            # We detect this by counting column-name matches AND by checking
+            # whether the query contains " and " / " or " / "," between
+            # a column-like word pattern (generic heuristic, no hardcoding).
+            dim_count = self._count_chart_dimensions(query, self._col_dt_list)
+            if dim_count >= 2:
+                return "multi"
+            # Generic heuristic: "pie chart for X and Y" where X/Y may not
+            # exactly match column names (e.g. partial words / aliases).
+            # Look for connector words between two non-chart noun phrases.
+            _connector_re = re.compile(
+                r'\b(?:for|of|by|on)\b.+\b(?:and|or)\b.+',
+                re.IGNORECASE,
+            )
+            if _connector_re.search(query):
+                return "multi"
+            return "specific"
         return "multi"
 
     def _should_show_scorecards(self, query: str) -> bool:
@@ -395,7 +656,95 @@ class ChartGenerator:
     def _needs_table(self, query: str) -> bool:
         return self._query_matches(query, self._BROAD_INTENT | self._PIVOT_INTENT | self._TABLE_EXPLICIT)
 
-    def _augment_query(self, query: str) -> str:
+    def _augment_query_with_plan(self, query: str, plan: QueryPlan) -> str:
+        """
+        Build the augmented query using a pre-computed QueryPlan.
+        Identical logic to _augment_query but uses plan fields directly —
+        no repeated calls to _query_mode, _extract_quantity, _detect_requested_chart_types.
+        """
+        mode     = plan.mode
+        quantity = plan.quantity
+        types    = plan.requested_types
+        _meta    = self._get_dataset_metadata()
+
+        if mode == "tables_only":
+            n = quantity if quantity > 1 else 2
+            return query + (
+                f"\n\n[TABLE INSTRUCTION]\nThe user wants ONLY tables — no charts, no scorecards. "
+                f"Return exactly {n} pivot table(s), each grouping by a different meaningful "
+                f"categorical column and aggregating a real numeric metric. "
+                f"Return an empty 'charts' array and empty 'scorecards' array."
+            )
+
+        if mode == "scorecards_only":
+            n = quantity if quantity > 1 else 6
+            return query + (
+                f"\n\n[SCORECARD INSTRUCTION]\nReturn exactly {n} KPI scorecards. "
+                f"No charts, no tables. Return empty 'charts' and 'tables' arrays."
+            )
+
+        if mode == "specific":
+            t = types[0] if types else "bar"
+            return query + f"\n\n[CHART INSTRUCTION]\nReturn exactly one {t} chart."
+
+        if mode == "multi":
+            if quantity > 1 and len(types) == 1:
+                return query + f"\n\n[CHART INSTRUCTION]\nReturn exactly {quantity} {types[0]} charts using different columns."
+            if len(types) == 1:
+                # Single chart type but multiple dimensions/columns requested
+                # (e.g. "pie chart for countries and continent").
+                # Instruct the LLM to produce one chart per dimension mentioned.
+                return query + (
+                    f"\n\n[CHART INSTRUCTION]\nThe user wants a {types[0]} chart for EACH "
+                    f"dimension/column mentioned in the query. Return one separate "
+                    f"{types[0]} chart per dimension — do NOT merge them into a single chart."
+                )
+            return query + f"\n\n[CHART INSTRUCTION]\nReturn one chart of each type: {', '.join(types)}."
+
+        if mode == "all_of_type":
+            type_str = " and ".join(types) if types else "chart"
+            return query + f"\n\n[CHART INSTRUCTION]\nReturn as many {type_str} charts as meaningful. No other chart types."
+
+        # exploratory — inject dataset structure + analytical priority
+        num_cols = _meta.get("num_cols", [])
+        cat_cols = _meta.get("cat_cols", [])
+        dt_cols  = _meta.get("dt_cols",  [])
+        primary_metric = _meta.get("primary_metric")
+        profit_metric  = _meta.get("profit_metric")
+        primary_cat    = _meta.get("primary_cat")
+
+        col_ctx = "\n\n[DATASET STRUCTURE — use this to generate a full dashboard]\n"
+        if dt_cols:  col_ctx += f"Date/time columns: {dt_cols}\n"
+        if num_cols: col_ctx += f"Numeric columns: {num_cols}\n"
+        if cat_cols: col_ctx += f"Categorical columns: {cat_cols}\n"
+
+        col_ctx += "\n[ANALYTICAL PRIORITY FOR THIS DATASET]\n"
+        if dt_cols:
+            col_ctx += (
+                f"1. FIRST chart MUST be a large line/area time-series using date column "
+                f"'{dt_cols[0]}'"
+            )
+            if primary_metric:
+                col_ctx += f" with y='{primary_metric}'"
+            if profit_metric and profit_metric != primary_metric:
+                col_ctx += f" and color/series also showing '{profit_metric}'"
+            col_ctx += ". layout_size: 'large'.\n"
+        if primary_metric and primary_cat:
+            col_ctx += (
+                f"2. SECOND chart: bar or grouped_bar of '{primary_metric}' "
+                f"by '{primary_cat}'. layout_size: 'medium'.\n"
+            )
+        col_ctx += (
+            "3. Then: category splits (pie/treemap for low-cardinality columns), "
+            "year-over-year comparisons (grouped_bar), "
+            "followed by distributions (histogram/box) last.\n"
+            "4. DO NOT place scatter/bubble/histogram/box as the first two charts.\n"
+        )
+        col_ctx += (
+            "\nGenerate as many charts as makes sense for a complete dashboard. "
+            "Cover time trends, category comparisons, and distributions."
+        )
+        return query + col_ctx
         """
         Identical to the original, except the 'Numeric columns' context injected
         for exploratory queries uses _meaningful_numeric_cols so the LLM never
@@ -417,27 +766,48 @@ class ChartGenerator:
         if mode == "scorecards_only":
             return query + (
                 "\n\n[SCORECARD INSTRUCTION]\nThe user wants ONLY KPI scorecards — no charts, no tables. "
-                "Return 5–8 meaningful scorecards covering different business dimensions. "
+                "Return 4-6 meaningful scorecards covering different business dimensions. "
                 "Return an empty 'charts' array and empty 'tables' array."
             )
 
         if mode == "exploratory":
-            # FIX 1: filter ID columns out of the column context
-            num_cols = _meaningful_numeric_cols(self.data)
-            cat_cols = self.data.select_dtypes(
-                include=["object", "category"]
-            ).columns.tolist()
-            dt_cols = [
-                c for c in self.data.columns
-                if "date" in c.lower() or "time" in c.lower()
-                or str(self.data[c].dtype).startswith("datetime")
-            ]
+            # Use cached metadata — all column classifications and cardinalities
+            # were computed once at dataset upload, not on every query.
+            _meta       = self._get_dataset_metadata()
+            num_cols    = _meta["num_cols"]
+            cat_cols    = _meta["cat_cols"]
+            dt_cols     = _meta["dt_cols"]
+            primary_metric = _meta["primary_metric"]
+            profit_metric  = _meta["profit_metric"]
+            primary_cat    = _meta["primary_cat"]
+
             col_ctx = "\n\n[DATASET STRUCTURE — use this to generate a full dashboard]\n"
             if dt_cols:  col_ctx += f"Date/time columns: {dt_cols}\n"
             if num_cols: col_ctx += f"Numeric columns: {num_cols}\n"
-            if cat_cols:
-                useful = [c for c in cat_cols if self.data[c].nunique() <= 30]
-                if useful: col_ctx += f"Categorical columns: {useful}\n"
+            if cat_cols: col_ctx += f"Categorical columns: {cat_cols}\n"
+
+            col_ctx += "\n[ANALYTICAL PRIORITY FOR THIS DATASET]\n"
+            if dt_cols:
+                col_ctx += (
+                    f"1. FIRST chart MUST be a large line/area time-series using date column "
+                    f"'{dt_cols[0]}'"
+                )
+                if primary_metric:
+                    col_ctx += f" with y='{primary_metric}'"
+                if profit_metric and profit_metric != primary_metric:
+                    col_ctx += f" and color/series also showing '{profit_metric}'"
+                col_ctx += ". layout_size: 'large'.\n"
+            if primary_metric and primary_cat:
+                col_ctx += (
+                    f"2. SECOND chart: bar or grouped_bar of '{primary_metric}' "
+                    f"by '{primary_cat}'. layout_size: 'medium'.\n"
+                )
+            col_ctx += (
+                "3. Then: category splits (pie/treemap for low-cardinality columns), "
+                "year-over-year comparisons (grouped_bar), "
+                "followed by distributions (histogram/box) last.\n"
+                "4. DO NOT place scatter/bubble/histogram/box as the first two charts.\n"
+            )
             col_ctx += (
                 "\nGenerate as many charts as makes sense for a complete dashboard. "
                 "Cover time trends, category comparisons, and distributions."
@@ -499,68 +869,123 @@ class ChartGenerator:
             raise asyncio.CancelledError(f"Cancelled at stage: {stage}")
 
     async def generate(self, query: str, task_id: str = "") -> dict:
-        key = _cache_key(self.data, query)
+        # Build cache key from the pre-computed fingerprint stored at upload time.
+        # Falls back to full DataFrame hashing only when dataset_id is unavailable.
+        if self._dataset_id is not None:
+            fingerprint = data_store.get_fingerprint(self._dataset_id)
+            key = (
+                _cache_key_from_fingerprint(fingerprint, query)
+                if fingerprint is not None
+                else _cache_key(self.data, query)
+            )
+        else:
+            key = _cache_key(self.data, query)
+
         if (cached := _result_cache.get(key)) is not None:
             logger.info("Cache hit for query: %r", query[:60])
             return cached
 
+        # ── Strategy: run is_data_query concurrently with the full pipeline ──
+        # correct_query is fast (~200ms) and must complete before get_chart_config
+        # so we keep it serial with the main call.  is_data_query is independent
+        # — fire it as a background task and check the result just before we
+        # commit to processing the LLM output.  This hides its latency entirely
+        # behind the typo-correction + data-prep + LLM-call sequence.
+        relevance_task = asyncio.create_task(
+            self._llm.is_data_query(query, self._col_dt_list)
+        )
+
+        corrected_query = await self._llm.correct_query(query, self._col_dt_list)
+
+        # Check relevance — if already done (fast model), this is free;
+        # otherwise we await however long remains.
+        is_relevant, rejection_reason = await relevance_task
+        if not is_relevant:
+            logger.info("Query rejected as off-topic: %r", query[:80])
+            return {"error": rejection_reason, "scorecards": [], "charts": [], "tables": []}
+        # ─────────────────────────────────────────────────────────────────────
+
         self._check_cancelled(task_id, "pre-start")
 
         loop = asyncio.get_running_loop()
-        corrected_query = await self._llm.correct_query(query, self._col_dt_list)
 
-        # Apply date filter — FIX 7: returns df with date col as datetime64
+        # Apply date filter
         filtered_data = await loop.run_in_executor(
             EXECUTOR, _apply_date_filter, self.data, corrected_query,
         )
 
-        # ALWAYS define working components
+        # Build stats for the working data once — shared by all working components.
+        # If no date filter was applied, reuse the stats already on the instance.
         if filtered_data is not self.data:
-            working_normalizer    = ChartConfigNormalizer(filtered_data)
+            working_stats         = DataFrameStats(filtered_data)
+            working_normalizer    = ChartConfigNormalizer(filtered_data, stats=working_stats)
             working_transformer   = DataTransformer(filtered_data)
             working_builder       = ChartBuilder(working_transformer)
             working_table_builder = TableBuilder(filtered_data)
-            working_scorecard     = ScorecardBuilder(filtered_data)
+            working_scorecard     = ScorecardBuilder(filtered_data, stats=working_stats)
         else:
+            working_stats         = self._stats
             working_normalizer    = self._normalizer
             working_builder       = self._builder
             working_table_builder = self._table_builder
             working_scorecard     = self._scorecard_builder
 
+        # Filter columns for LLM — use pre-computed num_cols from stats,
+        # no additional select_dtypes / _meaningful_numeric_cols call.
+        # Also exclude non-KPI numeric columns (area, size, lat/lon, etc.)
+        # so the LLM never receives them as chart or scorecard candidates.
+        from app.utils.data_store import _is_kpi_column as _kpi
+        num_col_set  = set(working_stats.num_cols)
+        all_num_cols = set(filtered_data.select_dtypes(include="number").columns)
+        working_col_dt_list = [
+            (c, dt) for c, dt in zip(filtered_data.columns, filtered_data.dtypes)
+            if c not in all_num_cols          # keep non-numeric cols (categoricals, dates)
+            or (c in num_col_set and _kpi(c)) # keep numeric cols only if they are KPIs
+        ]
 
-        # ALWAYS filter columns for LLM (independent of above)
-        def _filter_cols(df):
-            return [
-                (c, dt) for c, dt in zip(df.columns, df.dtypes)
-                if c not in df.select_dtypes(include="number").columns
-                or c in _meaningful_numeric_cols(df)
-            ]
+        # If a derived column was created at init time (e.g. Price_x_Quantity),
+        # inject it at the front of working_col_dt_list so the LLM always sees it
+        # as the preferred revenue/total metric.  Also remove the raw rate column
+        # (the one whose name contains a rate-hint) so the LLM cannot pick it and
+        # produce a meaningless sum.  This is generic — no hardcoded column names.
+        if self._derived_col and self._derived_col in filtered_data.columns:
+            # Find and drop the raw rate factor from the list
+            derived_lower = self._derived_col.lower()
+            rate_factor = next(
+                (c for c, _ in working_col_dt_list
+                 if any(h in c.lower().replace(" ", "").replace("_", "")
+                        for h in self._RATE_HINTS)
+                 and c != self._derived_col),
+                None,
+            )
+            if rate_factor:
+                working_col_dt_list = [(c, dt) for c, dt in working_col_dt_list if c != rate_factor]
+            # Prepend derived column if not already present
+            existing = {c for c, _ in working_col_dt_list}
+            if self._derived_col not in existing:
+                working_col_dt_list.insert(0, (self._derived_col, filtered_data[self._derived_col].dtype))
 
-        working_col_dt_list = _filter_cols(filtered_data)
+        # Compute query plan ONCE — all mode/show/quantity decisions come from here.
+        # Eliminates 5+ repeated calls to _query_mode and friends per request.
+        plan = self._make_query_plan(corrected_query)
 
-        effective_query = self._augment_query(corrected_query)
+        effective_query = self._augment_query_with_plan(corrected_query, plan)
 
-        sample, stats = await loop.run_in_executor(
-            EXECUTOR,
-            lambda: (filtered_data.head(5).to_string(), filtered_data.describe().round(2).to_string()),
-        )
+        # head(3).to_string() is trivial — no benefit from thread offload
+        sample = filtered_data.head(3).to_string()
+
+        # Retrieve the dataset profile from cache — computed once at upload.
+        dataset_context = self._get_dataset_metadata()["profile_str"]
 
         self._check_cancelled(task_id, "pre-llm")
 
-        mode = self._query_mode(corrected_query)
-
         # ── tables_only: skip get_chart_config entirely ───────────────────────
-        # Going through get_chart_config would trigger the "charts must be
-        # non-empty" schema validator and waste 2–3 retry/repair rounds.
-        if mode == "tables_only":
-            requested  = self._extract_non_chart_quantity(corrected_query, "table")
-            requested  = self._extract_non_chart_quantity(corrected_query, "tables") if requested == 1 else requested
-            capped     = min(requested, TABLE_MAX)
-            warning    = _over_limit_msg("tables", requested, TABLE_MAX) if requested > TABLE_MAX else None
-            logger.info("tables_only mode — calling get_table_config directly (requested=%d, max=%d)", requested, capped)
+        if plan.mode == "tables_only":
+            warning    = _over_limit_msg("tables", plan.table_quantity, TABLE_MAX) if plan.table_quantity > TABLE_MAX else None
+            logger.info("tables_only mode — calling get_table_config directly (max=%d)", plan.table_quantity)
             raw_table_cfgs = await self._llm.get_table_config(
-                working_col_dt_list, sample, stats, corrected_query,
-                max_tables=capped,
+                working_col_dt_list, sample, dataset_context, corrected_query,
+                max_tables=plan.table_quantity,
             )
             from app.schemas.chart_schema import TableConfigSchema
             from pydantic import ValidationError
@@ -571,7 +996,7 @@ class ChartGenerator:
                 except (ValidationError, Exception) as exc:
                     logger.warning("Table config validation failed: %s", exc)
 
-            tables = working_table_builder.build_all(validated[:capped])
+            tables = working_table_builder.build_all(validated[:plan.table_quantity])
             result = {"scorecards": [], "charts": [], "tables": tables}
             if warning:
                 result["warning"] = warning
@@ -581,15 +1006,12 @@ class ChartGenerator:
             return result
 
         # ── scorecards_only: skip get_chart_config entirely ───────────────────
-        if mode == "scorecards_only":
-            requested = self._extract_non_chart_quantity(corrected_query, "scorecard")
-            requested = self._extract_non_chart_quantity(corrected_query, "scorecards") if requested == 1 else requested
-            capped    = min(requested if requested > 1 else SCORECARD_MAX, SCORECARD_MAX)
-            warning   = _over_limit_msg("scorecards", requested, SCORECARD_MAX) if requested > SCORECARD_MAX else None
-            logger.info("scorecards_only mode — calling get_scorecard_config directly (max=%d)", capped)
+        if plan.mode == "scorecards_only":
+            warning   = _over_limit_msg("scorecards", plan.sc_quantity, SCORECARD_MAX) if plan.sc_quantity > SCORECARD_MAX else None
+            logger.info("scorecards_only mode — calling get_scorecard_config directly (max=%d)", plan.sc_quantity)
             raw_scorecard_cfgs = await self._llm.get_scorecard_config(
-                working_col_dt_list, sample, stats, corrected_query,
-                max_scorecards=capped,
+                working_col_dt_list, sample, dataset_context, corrected_query,
+                max_scorecards=plan.sc_quantity,
             )
             from app.schemas.chart_schema import ScorecardConfigSchema
             from pydantic import ValidationError
@@ -599,7 +1021,7 @@ class ChartGenerator:
                     validated_sc.append(ScorecardConfigSchema.model_validate(raw))
                 except (ValidationError, Exception) as exc:
                     logger.warning("Scorecard config validation failed: %s", exc)
-            scorecards = working_scorecard.build_from_llm(validated_sc[:capped])
+            scorecards = working_scorecard.build_from_llm(validated_sc[:plan.sc_quantity])
             result = {"scorecards": scorecards, "charts": [], "tables": []}
             if warning:
                 result["warning"] = warning
@@ -610,20 +1032,44 @@ class ChartGenerator:
         # ── end short-circuits ────────────────────────────────────────────────
 
         try:
-            llm_schema = await asyncio.wait_for(
-                self._llm.get_chart_config(working_col_dt_list, sample, stats, effective_query),
-                timeout=180,
-            )
+            # For exploratory/dashboard queries, fire get_table_config concurrently
+            # with get_chart_config — independent calls, table result not needed until both finish.
+            if plan.mode == "exploratory" and plan.show_tables:
+                chart_coro = self._llm.get_chart_config(
+                    working_col_dt_list, sample, "", effective_query,
+                    dataset_context=dataset_context, query_mode=plan.mode,
+                )
+                table_coro = self._llm.get_table_config(
+                    working_col_dt_list, sample, dataset_context, corrected_query,
+                    max_tables=2,
+                )
+                llm_schema, raw_table_cfgs_concurrent = await asyncio.wait_for(
+                    asyncio.gather(chart_coro, table_coro, return_exceptions=False),
+                    timeout=180,
+                )
+            else:
+                llm_schema = await asyncio.wait_for(
+                    self._llm.get_chart_config(
+                        working_col_dt_list, sample, "", effective_query,
+                        dataset_context=dataset_context, query_mode=plan.mode,
+                    ),
+                    timeout=180,
+                )
+                raw_table_cfgs_concurrent = None
         except asyncio.TimeoutError:
             logger.warning("LLM call timed out for query: %r", query[:60])
             llm_schema = self._llm._fallback_config(working_col_dt_list)
+            raw_table_cfgs_concurrent = None
+
+        # Apply Python-side aggregation inference
+        _apply_aggregation_inference(llm_schema, working_col_dt_list)
 
         self._check_cancelled(task_id, "post-llm")
 
-        if self._should_show_tables(corrected_query) and not llm_schema.tables:
+        if plan.show_tables and not llm_schema.tables:
             logger.info("No tables from main LLM — requesting separately")
-            raw_table_cfgs = await self._llm.get_table_config(
-                working_col_dt_list, sample, stats, corrected_query,
+            raw_table_cfgs = raw_table_cfgs_concurrent or await self._llm.get_table_config(
+                working_col_dt_list, sample, dataset_context, corrected_query,
                 max_tables=2,
             )
             if raw_table_cfgs:
@@ -643,6 +1089,7 @@ class ChartGenerator:
             EXECUTOR, self._process_sync,
             llm_schema, corrected_query, filtered_data,
             working_normalizer, working_builder, working_table_builder, working_scorecard,
+            plan,
         )
 
         self._check_cancelled(task_id, "post-processing")
@@ -658,44 +1105,37 @@ class ChartGenerator:
         working_builder=None,
         working_table_builder=None,
         working_scorecard=None,
+        plan: QueryPlan = None,
     ) -> dict:
-        """
-        Identical to the original _process_sync, with ONE change:
- 
-        FIX 3 — After _build_charts + all fallback attempts, if `charts` is
-        still empty, raise ValueError immediately.  The caller (_run in routes.py)
-        catches this, writes {"status": "error", "error": "<message>"} to
-        _results, and the frontend shows a clear error toast instead of an
-        empty dashboard with no explanation.
- 
-        The error message tells the operator WHY (no meaningful numeric columns
-        or all chart configs were invalid) so it's actionable.
-        """
-        import time, concurrent.futures
+        import time
         from app.utils.task_manager import is_cancelled
- 
-        logger.info("_process_sync START")
+
         t0 = time.perf_counter()
- 
         if working_data is None:          working_data          = self.data
         if working_normalizer is None:    working_normalizer    = self._normalizer
         if working_builder is None:       working_builder       = self._builder
         if working_table_builder is None: working_table_builder = self._table_builder
         if working_scorecard is None:     working_scorecard     = self._scorecard_builder
 
-        # Compute once here — passed into _build_charts and both fallback methods
-        # so _meaningful_numeric_cols (which logs on every call) fires exactly once
-        # per query instead of once per chart config.
-        _num_cols_cache = _meaningful_numeric_cols(working_data)
- 
-        mode            = self._query_mode(query)
-        requested_types = self._detect_requested_chart_types(query)
-        quantity        = self._extract_quantity(query)
- 
-        show_scorecards = self._should_show_scorecards(query)
+        # Use QueryPlan when available — all mode/show/quantity decisions already
+        # computed once in generate().  Fall back to recomputing only when called
+        # directly (e.g. tests) without a plan.
+        if plan is None:
+            plan = self._make_query_plan(query)
+
+        mode            = plan.mode
+        requested_types = plan.requested_types
+        quantity        = plan.quantity
+
+        _num_cols_cache = (
+            list(working_normalizer._stats.num_cols)
+            if working_normalizer._stats is not None
+            else _meaningful_numeric_cols(working_data)
+        )
+
         scorecards = (
             working_scorecard.build_from_llm(llm_schema.scorecards)
-            if show_scorecards else []
+            if plan.show_scorecards else []
         )
  
         if mode == "tables_only":
@@ -737,25 +1177,35 @@ class ChartGenerator:
                     "tables": [],
                 }
             llm_schema.charts = matching[:1]
-            if not self._should_show_scorecards(query): scorecards = []
-            if not self._should_show_tables(query):     llm_schema.tables = []
+            if not plan.show_scorecards: scorecards = []
+            if not plan.show_tables:     llm_schema.tables = []
  
         elif mode == "multi":
-            if quantity > 1 and len(requested_types) == 1:
+            if len(requested_types) == 1:
+                # Only one chart type was requested, but the query implies
+                # multiple charts of that type — either via an explicit
+                # quantity ("3 pie charts") or via multiple named dimensions
+                # ("pie chart for countries and continent"). Either way there
+                # is only one type to consider, so keep EVERY chart of that
+                # type the LLM returned. (Deduping by type, as the multi-type
+                # branch below does, would wrongly collapse these down to a
+                # single chart since they all share the same `type`.)
                 target = requested_types[0]
                 kept   = [c for c in llm_schema.charts if c.type == target]
-                while len(kept) < quantity:
-                    extra = self._fallback_chart_config_for_index(
-                        target, len(kept), working_data, num_cols=_num_cols_cache
-                    )
-                    if extra is None:
-                        break
-                    from app.schemas.chart_schema import ChartConfigSchema
-                    try:
-                        kept.append(ChartConfigSchema.model_validate(extra))
-                    except Exception:
-                        break
-                llm_schema.charts = kept[:quantity]
+                if quantity > 1:
+                    while len(kept) < quantity:
+                        extra = self._fallback_chart_config_for_index(
+                            target, len(kept), working_data, num_cols=_num_cols_cache
+                        )
+                        if extra is None:
+                            break
+                        from app.schemas.chart_schema import ChartConfigSchema
+                        try:
+                            kept.append(ChartConfigSchema.model_validate(extra))
+                        except Exception:
+                            break
+                    kept = kept[:quantity]
+                llm_schema.charts = kept
             else:
                 kept, covered = [], set()
                 for chart in llm_schema.charts:
@@ -801,7 +1251,7 @@ class ChartGenerator:
             requested_types=requested_types,
             num_cols=_num_cols_cache,
         )
-        charts = self._post_process_charts(charts, working_data)
+        charts = self._post_process_charts(charts, working_data, stats=working_normalizer._stats)
 
         # ── Per-mode chart cap ────────────────────────────────────────────────
         chart_warning = None
@@ -841,7 +1291,7 @@ class ChartGenerator:
  
         table_cfgs = self._filter_table_configs(llm_schema.tables)[:2]
         tables     = working_table_builder.build_all(table_cfgs)
-        if not self._should_show_tables(query):
+        if not plan.show_tables:
             tables = []
  
         result = {"scorecards": scorecards, "charts": charts, "tables": tables}
@@ -854,14 +1304,17 @@ class ChartGenerator:
         )
         return result
 
-    def _post_process_charts(self, charts: list, df: pd.DataFrame) -> list:
+    def _post_process_charts(self, charts: list, df: pd.DataFrame, stats=None) -> list:
         filtered = []
         for c in charts:
             if c.get("type") == "scatter":
                 x_col = c.get("x_label") or c.get("x")
                 y_col = c.get("y_label") or c.get("y")
                 if x_col in df.columns and y_col in df.columns:
-                    if df[x_col].nunique() < 5 or df[y_col].nunique() < 5:
+                    # Use pre-computed cardinality when available — avoids nunique() scan
+                    x_card = stats.card(x_col) if stats else df[x_col].nunique()
+                    y_card = stats.card(y_col) if stats else df[y_col].nunique()
+                    if x_card < 5 or y_card < 5:
                         continue
             filtered.append(c)
         unique, seen = [], set()
@@ -878,12 +1331,19 @@ class ChartGenerator:
         # Use pre-computed list when available — avoids re-running the logged call
         if num_cols is None:     num_cols     = _meaningful_numeric_cols(working_data)
 
-        def process_one(chart_schema):
-            cfg = normalizer.normalize(chart_schema)
-            return builder.build(cfg) if cfg else None
-
-        futures = [EXECUTOR.submit(process_one, cs) for cs in llm_schema.charts]
-        charts  = [f.result() for f in concurrent.futures.as_completed(futures) if f.result()]
+        # Sequential loop — pandas ops are GIL-bound so thread-per-chart
+        # parallelism adds context-switching overhead with zero parallelism gain.
+        # The groupby cache on DataTransformer also only works correctly when
+        # charts are built sequentially on the same instance.
+        charts = []
+        for chart_schema in llm_schema.charts:
+            try:
+                cfg   = normalizer.normalize(chart_schema)
+                chart = builder.build(cfg) if cfg else None
+                if chart:
+                    charts.append(chart)
+            except Exception as exc:
+                logger.warning("Chart build failed (%s): %s", getattr(chart_schema, 'type', '?'), exc)
 
         if charts:
             return charts

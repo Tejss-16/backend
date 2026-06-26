@@ -53,7 +53,4 @@ def _is_id_col(name: str) -> bool:
 def _meaningful_numeric_cols(df: pd.DataFrame) -> list[str]:
     raw = df.select_dtypes(include="number").columns.tolist()
     meaningful = [c for c in raw if not _is_id_col(c)]
-
-    logger.info("Meaningful numeric columns: %s", meaningful)
-
     return meaningful

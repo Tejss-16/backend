@@ -20,20 +20,36 @@ class ChartConfigNormalizer:
     Pure normalizer — never mutates the source DataFrame.
     Synthetic columns are passed as a Series in cfg["_synthetic"]
     so DataTransformer can join them on demand.
+
+    Accepts an optional DataFrameStats instance.  When provided, all
+    cardinality and numeric-column lookups use the pre-computed stats
+    so no additional DataFrame scans occur during normalisation.
     """
 
-    def __init__(self, df: pd.DataFrame):
-        self._df          = df
-        self._columns     = set(df.columns)
-        # FIX 1: use _meaningful_numeric_cols so ID columns are excluded globallyFID
-        self._num_cols    = set(_meaningful_numeric_cols(df))
+    def __init__(self, df: pd.DataFrame, stats=None):
+        self._df      = df
+        self._columns = set(df.columns)
+        self._stats   = stats   # DataFrameStats | None
+
+        if stats is not None:
+            # Use pre-computed numeric cols — no extra select_dtypes call
+            self._num_cols = set(stats.num_cols)
+        else:
+            self._num_cols = set(_meaningful_numeric_cols(df))
+
+        # Fallback cardinality dict for when stats is not provided
         self._cardinality: dict[str, int] = {}
+
         logger.debug(
-            "ChartConfigNormalizerFixed: meaningful numeric cols = %s",
+            "ChartConfigNormalizer: meaningful numeric cols = %s",
             sorted(self._num_cols),
         )
 
     def _card(self, col: str) -> int:
+        if self._stats is not None:
+            # Delegate to DataFrameStats — result is cached there
+            return self._stats.card(col)
+        # Fallback: local cache (original behaviour)
         if col not in self._cardinality:
             self._cardinality[col] = self._df[col].nunique()
         return self._cardinality[col]
@@ -70,7 +86,7 @@ class ChartConfigNormalizer:
             return None
  
         chosen = candidates[0]
-        logger.info("Heatmap: auto-selected z=%r from candidates %s", chosen, candidates)
+        logger.debug("Heatmap: auto-selected z=%r from candidates %s", chosen, candidates)
         return chosen
 
     def normalize(self, schema: ChartConfigSchema) -> dict | None:

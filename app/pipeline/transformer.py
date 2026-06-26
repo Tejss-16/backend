@@ -13,6 +13,13 @@ class DataTransformer:
     def __init__(self, df: pd.DataFrame):
         self._source = df
         self._time_cache: dict[str, bool] = {}
+        # Columns already converted to datetime64 within this transformer instance.
+        # After upload-time date parsing, most date columns arrive as datetime64
+        # already — this set guards the rare case where _parse_time_inplace is
+        # still called (e.g. for filtered DataFrames) so it never re-parses.
+        self._parsed_cols: set[str] = set()
+        # Memoized groupby results — see transform() for details.
+        self._groupby_cache: dict[tuple, pd.DataFrame] = {}
 
     def transform(self, cfg: dict) -> pd.DataFrame:
         x, y    = cfg["x"], cfg["y"]
@@ -31,28 +38,58 @@ class DataTransformer:
             return self._source[[x, y]].drop_duplicates()
 
         z = cfg.get("z")
-
-        real_cols = [c for c in ({x, y, z} | ({color} if color else set()))
-                    if c and c in self._source.columns]
-        df = self._source[real_cols].copy()
-
         synthetic: pd.Series | None = cfg.get("_synthetic")
-        if synthetic is not None and synthetic.name not in df.columns:
-            df[synthetic.name] = synthetic.values
 
-        if is_time:
-            self._parse_time_inplace(df, x)
-            self._granularise_inplace(df, x, cfg["time_granularity"])
-
+        # ── Build group_keys and target (needed for cache key) ────────────────
         if cfg["type"] == "heatmap":
             group_keys = [x, y]
+            target     = z
         else:
             group_keys = [x] if not color else [x, color]
+            target     = y
 
-        if agg != "none":
-            target = z if cfg["type"] == "heatmap" else y
-            df = df.groupby(group_keys)[target].agg(agg).reset_index()
+        # ── Attempt to serve from groupby cache ───────────────────────────────
+        # Cache is only valid when:
+        #   1. There is an aggregation to run (agg != "none")
+        #   2. No synthetic column is involved (synthetic data is chart-specific)
+        #   3. The target column exists in the source
+        cache_key = (
+            tuple(group_keys), target, agg, x,
+            cfg["time_granularity"] if is_time else "none",
+        )
+        use_cache = (
+            agg != "none"
+            and synthetic is None
+            and target is not None
+            and target in self._source.columns
+        )
 
+        if use_cache and cache_key in self._groupby_cache:
+            # Cache hit: retrieve the pre-aggregated frame and run only the
+            # cheap post-processing steps that are chart-specific.
+            df = self._groupby_cache[cache_key].copy()
+        else:
+            # Cache miss: perform the full column selection + optional time
+            # parsing/granularising + groupby aggregation.
+            real_cols = [c for c in ({x, y, z} | ({color} if color else set()))
+                        if c and c in self._source.columns]
+            df = self._source[real_cols].copy()
+
+            if synthetic is not None and synthetic.name not in df.columns:
+                df[synthetic.name] = synthetic.values
+
+            if is_time:
+                self._parse_time_inplace(df, x)
+                self._granularise_inplace(df, x, cfg["time_granularity"])
+
+            if agg != "none":
+                df = df.groupby(group_keys)[target].agg(agg).reset_index()
+
+            # Store in cache only when no synthetic data was used
+            if use_cache:
+                self._groupby_cache[cache_key] = df.copy()
+
+        # ── Post-processing (always runs — chart-type specific) ───────────────
         if is_time:
             df = self._fill_gaps(df, x, y, cfg["time_granularity"], color=color)
             if cfg["type"] == "line":
@@ -113,13 +150,29 @@ class DataTransformer:
         self._time_cache[col] = result
         return result
 
-    @staticmethod
-    def _parse_time_inplace(df: pd.DataFrame, col: str) -> None:
-        if pd.api.types.is_datetime64_any_dtype(df[col]):
-            return  # already parsed
+    def _parse_time_inplace(self, df: pd.DataFrame, col: str) -> None:
+        """
+        Convert col to datetime64 in-place.
 
-        # FIX 3: probe the full column directly (no astype(str) conversion)
-        # and reuse the parsed result — avoids parsing the column twice.
+        Fast path: if the column is already datetime64 (set by upload-time
+        _parse_date_columns or a prior call) this is a single dtype check —
+        no parsing work at all.  _parsed_cols tracks columns converted within
+        this transformer instance so the format-loop never runs twice for the
+        same column in a multi-chart request.
+        """
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
+            self._parsed_cols.add(col)
+            return  # already parsed (upload-time or prior call)
+
+        if col in self._parsed_cols:
+            # Already parsed in a prior chart transform for this instance;
+            # the working df copy hasn't been converted yet — do it cheaply
+            # by casting from the already-parsed source column.
+            if col in self._source.columns and pd.api.types.is_datetime64_any_dtype(self._source[col]):
+                df[col] = self._source[col].values
+                return
+            # Source not yet datetime either — fall through to format loop below
+
         FORMATS_TO_TRY = [
             "%Y-%m-%d",
             "%m/%d/%Y",
@@ -141,17 +194,16 @@ class DataTransformer:
             try:
                 parsed = pd.to_datetime(df[col], format=fmt, errors="coerce")
                 if parsed.notna().sum() / non_null_count >= 0.80:
-                    df[col] = parsed  # reuse — no second parse needed
+                    df[col] = parsed
+                    self._parsed_cols.add(col)
                     return
             except Exception:
                 continue
 
-        # No single format matched well — fall back to mixed/dateutil inference.
-        # FIX 1 (shared): suppress the UserWarning that pandas emits when it
-        # cannot infer a single format and falls back to dateutil per-element.
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             df[col] = pd.to_datetime(df[col], errors="coerce")
+        self._parsed_cols.add(col)
 
     @staticmethod
     def _granularise_inplace(df: pd.DataFrame, col: str, granularity: str) -> None:

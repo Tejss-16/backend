@@ -105,6 +105,7 @@ class ScorecardConfigSchema(BaseModel):
     column:      str
     aggregation: ScorecardAgg = "sum"
     label:       str          = ""
+    subtitle:    str          = ""   # optional contextual annotation, e.g. "58.6% margin"
 
     @field_validator("column", mode="before")
     @classmethod
@@ -117,6 +118,11 @@ class ScorecardConfigSchema(BaseModel):
     @field_validator("label", mode="before")
     @classmethod
     def default_label(cls, v):
+        return v or ""
+
+    @field_validator("subtitle", mode="before")
+    @classmethod
+    def default_subtitle(cls, v):
         return v or ""
 
 

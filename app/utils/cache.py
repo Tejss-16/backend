@@ -8,12 +8,8 @@ import pandas as pd
 def _df_fingerprint(df: pd.DataFrame) -> str:
     """
     Full-content fingerprint using pandas' own row hashing.
-    pd.util.hash_pandas_object hashes every cell of every row, then we
-    XOR-sum all row hashes into a single uint64 and fold it into MD5.
-    Cost: O(n*c) — acceptable because this runs once per request, not
-    per chart. For very large DataFrames (>500k rows) a stratified
-    sample of 10k rows gives collision resistance that is good enough
-    in practice while keeping latency under 50 ms.
+    Called ONCE at upload time and stored in DataStore.
+    Never called again during request handling.
     """
     if len(df) == 0:
         return hashlib.md5(b"empty").hexdigest()
@@ -25,10 +21,24 @@ def _df_fingerprint(df: pd.DataFrame) -> str:
     return hashlib.md5(f"{meta}|{content_hash}".encode()).hexdigest()
 
 
-def _cache_key(df: pd.DataFrame, query: str) -> str:
+def _cache_key_from_fingerprint(fingerprint: str, query: str) -> str:
+    """
+    Build a cache key from a pre-computed fingerprint.
+    Zero DataFrame access — just two string ops and an MD5.
+    This is the primary cache key path used during request handling.
+    """
     return hashlib.md5(
-        f"{_df_fingerprint(df)}|{query.strip().lower()}".encode()
+        f"{fingerprint}|{query.strip().lower()}".encode()
     ).hexdigest()
+
+
+def _cache_key(df: pd.DataFrame, query: str) -> str:
+    """
+    Fallback: compute fingerprint inline.
+    Only used when dataset_id is unavailable (e.g. tests, legacy callers).
+    In normal request handling, use _cache_key_from_fingerprint instead.
+    """
+    return _cache_key_from_fingerprint(_df_fingerprint(df), query)
 
 
 class _LRUCache:
