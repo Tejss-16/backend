@@ -500,6 +500,27 @@ class ChartGenerator:
         "table", "tables", "tabular", "grid", "data table",
         "show table", "give table", "add table", "include table",
     }
+    _SUGGESTIONS_INTENT = {
+        "what charts", "which charts", "what reports", "which reports",
+        "what can be made", "what can i make", "what can we make",
+        "what can be created", "what can i create", "what can we create",
+        "what can be built", "what can i build", "what can we build",
+        "what visualizations", "what visualisations", "what graphs",
+        "what analyses can", "what analysis can",
+        "suggest charts", "suggest reports", "suggest visualizations",
+        "recommend charts", "recommend reports",
+        "possible charts", "possible reports", "possible visualizations",
+        "all possible charts", "all possible reports", "all possible analyses",
+        "list all possible", "list possible", "list all charts", "list all reports",
+        "what all charts", "what all reports", "what all can",
+        "list of charts", "list of reports", "list of analyses",
+        "what dashboards", "what can this data show", "what can the data show",
+        # Follow-up triggers
+        "more suggestions", "more charts", "more reports", "more analyses",
+        "give more", "show more", "more options", "more ideas",
+        "other suggestions", "other charts", "other reports", "other analyses",
+        "additional suggestions", "additional charts", "different suggestions",
+    }
     _CHART_TYPE_KEYWORDS = {
         "line": "line", "line chart": "line",
         "area": "area", "area chart": "area",
@@ -604,6 +625,9 @@ class ChartGenerator:
         return matched
 
     def _query_mode(self, query: str) -> str:
+        # Suggestions intent fires first — no chart generation needed.
+        if self._query_matches(query, self._SUGGESTIONS_INTENT):
+            return "suggestions"
         types    = self._detect_requested_chart_types(query)
         quantity = self._extract_quantity(query)
         # Check for table-only / scorecard-only BEFORE falling to exploratory,
@@ -868,6 +892,101 @@ class ChartGenerator:
             logger.warning("Cancel flag detected at stage '%s' for task %s", stage, task_id)
             raise asyncio.CancelledError(f"Cancelled at stage: {stage}")
 
+    async def _generate_suggestions(self, col_dt_list: list, sample: str, dataset_context: str) -> dict:
+        """
+        Ask the LLM to enumerate charts, tables, and analyses that can be
+        produced from this dataset.  Returns:
+          {
+            "suggestions": {
+              "charts":   [{"title": str, "description": str}, ...],
+              "tables":   [{"title": str, "description": str}, ...],
+              "analyses": [{"title": str, "description": str}, ...],
+            },
+            "charts": [], "tables": [], "scorecards": [],
+          }
+        The empty charts/tables/scorecards keys keep the response shape uniform
+        so the frontend doesn't need special-casing.
+        """
+        import json as _json
+        import re as _re
+
+        col_names  = [c for c, _ in col_dt_list]
+        meta       = self._get_dataset_metadata()
+        num_cols   = meta.get("num_cols", [])
+        cat_cols   = meta.get("cat_cols", [])
+        dt_cols    = meta.get("dt_cols", [])
+
+        col_context = ""
+        if num_cols:  col_context += f"Numeric / metric columns: {num_cols}\n"
+        if cat_cols:  col_context += f"Categorical / dimension columns: {cat_cols}\n"
+        if dt_cols:   col_context += f"Date / time columns: {dt_cols}\n"
+
+        prompt = f"""You are a data analytics consultant. A user has uploaded a dataset and wants to know
+what charts, reports, and analyses can be produced from it.
+
+Dataset schema:
+{col_context}
+Dataset context:
+{dataset_context}
+
+Sample rows:
+{sample}
+
+Your task: Generate a concise, practical list of suggestions grouped into three categories.
+
+Rules:
+- Each suggestion must be achievable from the columns listed above.
+- Use specific column names (not generic placeholders like "column A").
+- Keep titles short (≤ 8 words). Keep descriptions to 1 sentence.
+- Charts: mention the chart type (bar, line, pie, scatter, histogram, etc.).
+- Tables: mention pivot table groupings or summaries.
+- Analyses: mention statistical or trend analyses (correlation, trend, distribution, etc.).
+- Return as many meaningful suggestions as the dataset supports, up to 10 per category. Skip any that would be redundant or uninformative.
+- If the conversation history shows suggestions were already given, return only NEW ones not previously mentioned.
+- If no date column exists, skip time-series chart suggestions.
+- Do NOT include suggestions that require columns not present in the dataset.
+
+Return ONLY valid JSON (no markdown, no explanation):
+{{
+  "charts": [
+    {{"title": "...", "description": "..."}},
+    ...
+  ],
+  "tables": [
+    {{"title": "...", "description": "..."}},
+    ...
+  ],
+  "analyses": [
+    {{"title": "...", "description": "..."}},
+    ...
+  ]
+}}
+"""
+        try:
+            raw   = await self._llm._call([
+                {"role": "system", "content": "Return only JSON. No markdown. No explanation."},
+                {"role": "user",   "content": prompt},
+            ])
+            clean = _re.sub(r"```(?:json)?|```", "", raw).strip()
+            data  = _json.loads(clean)
+            result = {}
+            for key in ("charts", "tables", "analyses"):
+                items = data.get(key, [])
+                if not isinstance(items, list):
+                    items = []
+                result[key] = [
+                    {"title": str(it.get("title", "")), "description": str(it.get("description", ""))}
+                    for it in items if it.get("title")
+                ][:10]
+            logger.info(
+                "Suggestions generated: %d charts, %d tables, %d analyses",
+                len(result["charts"]), len(result["tables"]), len(result["analyses"]),
+            )
+            return {"suggestions": result, "charts": [], "tables": [], "scorecards": []}
+        except Exception as exc:
+            logger.warning("_generate_suggestions failed (%s) — returning empty", exc)
+            return {"suggestions": {"charts": [], "tables": [], "analyses": []}, "charts": [], "tables": [], "scorecards": []}
+
     async def generate(self, query: str, task_id: str = "") -> dict:
         # Build cache key from the pre-computed fingerprint stored at upload time.
         # Falls back to full DataFrame hashing only when dataset_id is unavailable.
@@ -978,6 +1097,17 @@ class ChartGenerator:
         dataset_context = self._get_dataset_metadata()["profile_str"]
 
         self._check_cancelled(task_id, "pre-llm")
+
+        # ── suggestions: enumerate possible charts/reports — no rendering ────
+        if plan.mode == "suggestions":
+            logger.info("suggestions mode — generating chart/report suggestions")
+            result = await self._generate_suggestions(
+                col_dt_list=working_col_dt_list,
+                sample=sample,
+                dataset_context=dataset_context,
+            )
+            _result_cache.set(key, result)
+            return result
 
         # ── tables_only: skip get_chart_config entirely ───────────────────────
         if plan.mode == "tables_only":

@@ -451,6 +451,17 @@ _DATA_SIGNALS = {
     # Excel-style aggregation / lookup function requests against the dataset
     "vlookup", "hlookup", "xlookup", "lookup",
     "counta", "median", "mode",
+    # Suggestions intent — user asks what charts/reports can be made
+    "what charts", "which charts", "what reports", "suggest charts",
+    "what can be made", "what can i make", "what can we make",
+    "possible charts", "possible reports", "what visualizations",
+    "what analyses", "recommend charts", "list of charts",
+    "list all possible", "list possible", "all possible reports",
+    "all possible charts", "list all charts", "list all reports",
+    # Follow-up suggestions — bare "more" excluded (too generic for off-topic guard)
+    "more suggestions", "more charts", "more reports", "more analyses",
+    "give more", "show more", "more options", "other suggestions",
+    "additional suggestions", "additional charts",
 }
 
 
@@ -612,10 +623,36 @@ SUMMARY_TRIGGERS = [
     "overall", "holistic", "comprehensive", "give me a report",
 ]
 
+# Triggers for the suggestions intent — user wants to know what
+# charts / reports / analyses are possible from their data.
+SUGGESTIONS_TRIGGERS = [
+    "what charts", "which charts", "what reports", "which reports",
+    "what can be made", "what can i make", "what can we make",
+    "what can be created", "what can i create", "what can we create",
+    "what can be built", "what can i build", "what can we build",
+    "what visualizations", "what visualisations", "what graphs",
+    "what analyses can", "what analysis can", "what insights can",
+    "suggest charts", "suggest reports", "suggest visualizations",
+    "recommend charts", "recommend reports", "recommend visualizations",
+    "possible charts", "possible reports", "possible visualizations",
+    "all possible charts", "all possible reports", "all possible analyses",
+    "list all possible", "list possible", "list all charts", "list all reports",
+    "what all charts", "what all reports", "what all can",
+    "list of charts", "list of reports", "list of analyses",
+    "what dashboards", "what can this data show", "what can the data show",
+    # Follow-up triggers — user wants more suggestions beyond the first batch
+    "more suggestions", "more charts", "more reports", "more analyses",
+    "give more", "show more", "more options", "more ideas",
+    "other suggestions", "other charts", "other reports", "other analyses",
+    "additional suggestions", "additional charts", "different suggestions",
+]
+
 
 def _keyword_classify_query(query: str) -> str:
     """Original keyword-based fallback."""
     q = query.lower()
+    if any(t in q for t in SUGGESTIONS_TRIGGERS):
+        return "suggestions"
     if any(t in q for t in SUMMARY_TRIGGERS):
         return "summary"
     if any(t in q for t in EXPLANATION_TRIGGERS):
@@ -639,6 +676,7 @@ User query: {query}
 Dataset columns: {columns}
 
 Intent types:
+- "suggestions" — user wants to know what charts, reports, analyses, or visualizations can be made from the data
 - "summary"     — user wants a broad overview, insights, analysis, report, or exploration of the whole dataset
 - "explanatory" — user asks WHY something happened, wants causes/drivers/reasons
 - "comparison"  — user wants to compare two or more groups, segments, or time periods
@@ -647,12 +685,13 @@ Intent types:
 
 Rules:
 - Pick the single BEST intent. Do not mix.
+- "suggestions" applies to: "what charts can be made", "what reports can I get", "what can be visualized", "suggest charts", "recommend visualizations", "what analyses are possible", "what all can be made from this data".
 - "summary" applies to: "give me insights", "analyse this", "give information", "summarize", "overview", "tell me about the data", "what does the data show", "explore the data", "give me a report", "key metrics", "executive summary".
 - "trend" requires a time dimension; without dates, re-classify as "lookup".
 - "explanatory" queries often contain: why, reason, cause, explain, what drove, contributing.
 - Phrasing like "has sales gone up" is a trend, even without the word "trend".
 
-Return ONLY valid JSON: {{"intent": "summary"}} (or explanatory/comparison/trend/lookup)
+Return ONLY valid JSON: {{"intent": "suggestions"}} (or summary/explanatory/comparison/trend/lookup)
 No markdown. No explanation.
 """
     try:
@@ -662,7 +701,7 @@ No markdown. No explanation.
         ])
         clean = re.sub(r"```(?:json)?|```", "", raw).strip()
         intent = json.loads(clean).get("intent", "").strip().lower()
-        if intent in ("explanatory", "comparison", "trend", "lookup", "summary"):
+        if intent in ("explanatory", "comparison", "trend", "lookup", "summary", "suggestions"):
             logger.info("LLM query classification: %r → %s", query[:60], intent)
             return intent
         logger.warning("LLM returned unknown intent %r — falling back to keyword match", intent)
@@ -1397,6 +1436,106 @@ Return ONLY a valid JSON object with this exact structure (no markdown, no extra
 
 
 
+# ─────────────────────────────────────────────
+# SUGGESTIONS GENERATOR
+# Called when query_type == "suggestions".
+# Returns a structured list of chart/report ideas derivable from the data.
+# ─────────────────────────────────────────────
+
+async def _llm_generate_suggestions(
+    df: pd.DataFrame,
+    schema: dict,
+    history_block: str,
+    llm,
+) -> dict:
+    """
+    Ask the LLM to enumerate meaningful charts, tables, and analyses that can
+    be built from this dataset.  Returns a dict:
+      {
+        "charts":    [{"title": str, "description": str}, ...],
+        "tables":    [{"title": str, "description": str}, ...],
+        "analyses":  [{"title": str, "description": str}, ...],
+      }
+
+    Falls back to a minimal structure on any failure so the caller always gets
+    something renderable.
+    """
+    metrics    = schema.get("metrics", [])
+    dimensions = schema.get("dimensions", [])
+    date_col   = schema.get("date_col")
+
+    col_context = ""
+    if metrics:    col_context += f"Numeric / metric columns: {metrics}\n"
+    if dimensions: col_context += f"Categorical / dimension columns: {dimensions}\n"
+    if date_col:   col_context += f"Date / time column: {date_col}\n"
+
+    sample_str = df.head(5).to_string()
+
+    prompt = f"""You are a data analytics consultant. A user has uploaded a dataset and wants to know
+what charts, reports, and analyses can be produced from it.
+
+Dataset schema:
+{col_context}
+Sample rows:
+{sample_str}
+
+Conversation so far:
+{history_block}
+
+Your task: Generate a concise, practical list of suggestions grouped into three categories.
+
+Rules:
+- Each suggestion must be achievable from the columns listed above.
+- Use specific column names (not generic placeholders like "column A").
+- Keep titles short (≤ 8 words). Keep descriptions to 1 sentence.
+- Charts: mention the chart type (bar, line, pie, scatter, histogram, etc.).
+- Tables: mention pivot table groupings or summaries.
+- Analyses: mention statistical or trend analyses (correlation, trend, distribution, etc.).
+- Return as many meaningful suggestions as the dataset supports, up to 10 per category. Skip any that would be redundant or uninformative.
+- If the conversation history shows suggestions were already given, return only NEW ones not previously mentioned.
+- If no date column exists, skip time-series chart suggestions.
+- Do NOT include suggestions that require columns not present in the dataset.
+
+Return ONLY valid JSON (no markdown, no explanation):
+{{
+  "charts": [
+    {{"title": "...", "description": "..."}},
+    ...
+  ],
+  "tables": [
+    {{"title": "...", "description": "..."}},
+    ...
+  ],
+  "analyses": [
+    {{"title": "...", "description": "..."}},
+    ...
+  ]
+}}
+"""
+    try:
+        raw = await llm._call([
+            {"role": "system", "content": "Return only JSON. No markdown. No explanation."},
+            {"role": "user", "content": prompt},
+        ])
+        clean = re.sub(r"```(?:json)?|```", "", raw).strip()
+        data = json.loads(clean)
+        # Validate structure — ensure expected keys exist with list values
+        result = {}
+        for key in ("charts", "tables", "analyses"):
+            items = data.get(key, [])
+            if not isinstance(items, list):
+                items = []
+            # Keep only items that have at least a title
+            result[key] = [
+                {"title": str(it.get("title", "")), "description": str(it.get("description", ""))}
+                for it in items if it.get("title")
+            ][:10]
+        return result
+    except Exception as e:
+        logger.warning("_llm_generate_suggestions failed (%s) — returning empty suggestions", e)
+        return {"charts": [], "tables": [], "analyses": []}
+
+
 class ChatService:
     def __init__(self, df: pd.DataFrame):
         self.df = df
@@ -1406,6 +1545,36 @@ class ChatService:
         history = history or []
         columns = list(self.df.columns)
         history_block = format_history(history)
+
+        # ── PRE-STEP: history-aware follow-up detection ───────────────────────
+        # Short bare queries like "more", "more please", "give me more" would
+        # fail the off-topic guard because they contain no data signals.
+        # If the last assistant response was a suggestions result, treat any
+        # short follow-up as a continuation suggestions request — skip the guard
+        # and classify directly.
+        _FOLLOWUP_RE = re.compile(
+            r"^\s*(?:give\s+)?(?:me\s+)?more(?:\s+please)?"
+            r"|^\s*show\s+more"
+            r"|^\s*more\s+please"
+            r"|^\s*(?:yes[,.]?\s*)?(?:give|show)\s+more",
+            re.IGNORECASE,
+        )
+        if _FOLLOWUP_RE.match(query.strip()):
+            # Check if the last assistant turn was a suggestions response
+            for msg in reversed(history):
+                if msg.get("role") == "assistant":
+                    content = msg.get("content", {})
+                    if isinstance(content, dict) and content.get("is_suggestions"):
+                        logger.info("Follow-up 'more' detected after suggestions — routing to suggestions")
+                        schema = _dtype_inspect_schema(self.df)
+                        suggestions = await _llm_generate_suggestions(
+                            df=self.df,
+                            schema=schema,
+                            history_block=history_block,
+                            llm=self._llm,
+                        )
+                        return {"answer": suggestions, "table": None, "is_suggestions": True}
+                    break  # only check the most recent assistant message
 
         # ── STEP -1: OFF-TOPIC GUARD — fires before everything else ──────────
         # Two-layer: fast keyword pre-filter → LLM judgment for uncertain cases.
@@ -1437,6 +1606,17 @@ class ChatService:
                 llm=self._llm,
             )
             return {"answer": summary_json, "table": None, "is_summary": True}
+
+        # ── SUGGESTIONS PATH — what charts/reports can be made from this data ─
+        if query_type == "suggestions":
+            logger.info("Suggestions path triggered for query: %s", query)
+            suggestions = await _llm_generate_suggestions(
+                df=self.df,
+                schema=schema,
+                history_block=history_block,
+                llm=self._llm,
+            )
+            return {"answer": suggestions, "table": None, "is_suggestions": True}
 
         # ── REASONING LAYER — pandas blocks + LLM narration  [CHANGE 3] ──────
         reasoning_insights: list[dict] = []
